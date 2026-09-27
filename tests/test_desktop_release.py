@@ -29,6 +29,23 @@ def step(name, job="package", file="desktop-package.yml"):
     return next(item for item in workflow(file)["jobs"][job]["steps"] if item.get("name") == name)
 
 
+def secret_references(value):
+    """Names from canonical `${{ secrets.NAME }}` references; None marks any other `secrets` mention.
+
+    Any access to the secrets context must spell the token, so counting every mention fails closed
+    without parsing the expression language (index syntax, format strings, toJSON, prose).
+    """
+    if isinstance(value, dict):
+        return set().union(*(secret_references(item) for pair in value.items() for item in pair))
+    if isinstance(value, list):
+        return set().union(*(secret_references(item) for item in value))
+    if not isinstance(value, str):
+        return set()
+    canonical = re.findall(r"\$\{\{\s*secrets\.([A-Za-z_]\w*)\s*\}\}", value, re.IGNORECASE)
+    other = len(re.findall(r"\bsecrets\b", value, re.IGNORECASE)) > len(canonical)
+    return {name.upper() for name in canonical} | ({None} if other else set())
+
+
 def assemble_assets(root, source=SOURCE):
     """Use the real Runtime archive writer and desktop producer, then merge downloads."""
     directory = root / "desktop-dist"
@@ -215,7 +232,8 @@ def test_workflow_preserves_manual_path_and_isolates_test_signing():
     jobs = workflow("release_ai.yml")["jobs"]
     caller = jobs["desktop-packages"]
     assert caller["uses"] == "./.github/workflows/desktop-package.yml"
-    assert "secrets" not in caller
+    # Environment secrets resolve empty in a called job without inheritance (actions/runner#4453).
+    assert caller["secrets"] == "inherit"
     assert caller["with"]["source_sha"] == "${{ needs.resolve-desktop-release.outputs.source_sha }}"
     build = package["jobs"]["package"]
     steps = build["steps"]
@@ -227,6 +245,41 @@ def test_workflow_preserves_manual_path_and_isolates_test_signing():
     assert "codesign --force --deep --sign -" in step("Verify macOS app signature matches the signing path")["run"]
     assert "NotSigned" in step("Verify unsigned Windows installer")["run"]
     assert steps[-1]["uses"] == "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f"
+
+
+@pytest.mark.parametrize(("value", "names"), [
+    ("${{ secrets.tauri_signing_private_key }}", {"TAURI_SIGNING_PRIVATE_KEY"}),
+    ("a ${{secrets.APPLE_API_KEY}} b ${{ Secrets.APPLE_API_ISSUER }}", {"APPLE_API_KEY", "APPLE_API_ISSUER"}),
+    ("${{ secrets['APPLE_CERTIFICATE'] }}", {None}),
+    ("${{ format('{{Hello {0}!}}', secrets.APPLE_CERTIFICATE) }}", {None}),
+    ("${{ secrets.TAURI_SIGNING_PRIVATE_KEY }} ${{ toJSON(secrets) }}", {"TAURI_SIGNING_PRIVATE_KEY", None}),
+    ("${{ secrets[matrix.name] }}", {None}),
+    ("secrets.APPLE_CERTIFICATE != ''", {None}),
+    ("echo ${{ inputs.secrets }}", {None}),
+    ("echo ${{ inputs.release_tag }}", set()),
+])
+def test_secret_scanner_fails_closed_on_every_noncanonical_form(value, names):
+    assert secret_references({"env": {"VALUE": value}}) == names
+
+
+def test_inherited_secrets_reach_test_builds_only_as_the_updater_pair():
+    package = workflow("desktop-package.yml")
+    assert package["on" if "on" in package else True]["workflow_call"]["inputs"]["release_tag"]["required"] is True
+    assert secret_references({key: value for key, value in package.items() if key != "jobs"}) == set()
+    updater = {"TAURI_SIGNING_PRIVATE_KEY", "TAURI_SIGNING_PRIVATE_KEY_PASSWORD"}
+    reachable = set()
+    for job in package["jobs"].values():
+        assert secret_references({key: value for key, value in job.items() if key != "steps"}) == set()
+        for item in job["steps"]:
+            names = secret_references(item)
+            assert None not in names, item.get("name")
+            if names - updater:
+                condition = item.get("if", "")
+                assert "||" not in condition, item.get("name")
+                assert re.fullmatch(r"(.+ && )?inputs\.release_tag == ''", condition), item.get("name")
+            else:
+                reachable |= names
+    assert reachable == updater
 
 
 @pytest.mark.parametrize("configured", [False, True])
