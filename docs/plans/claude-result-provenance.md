@@ -250,3 +250,36 @@ Web/IM end-to-end tests. The ledger remains process-local; restart coverage
 concerns the existing durable Activity receipt store, not a new unsolicited
 output outbox. Fresh automatic exact-head review and CI remain required after
 the single push; local tests do not establish acceptance.
+
+## Agent-initiated Turn settlement on retirement (2026-09-27)
+
+A task-notification Result is detached output, so its delivery never completes
+a Turn. When that output belonged to a synthetic agent-initiated owner, the
+retirement in transition 9 released only the runtime gate. The agent-initiated
+Turn's waiter was never signalled. The Session therefore stayed in flight
+("delivering"), Stop waited for a terminal that could not arrive, and later
+human input queued behind the Turn indefinitely.
+
+- Retiring a synthetic owner is that owner's terminal boundary. It ends the
+  agent-initiated Turn through the canonical empty terminal result
+  (`completes_turn=True`, `completes_run=False`) before the gate is released,
+  matching the forced-cancel settle path. The Run, if any, stays with the
+  detached output that already settled it. The output record is already gone,
+  so nothing retries this settle: if it fails or is cancelled, the Turn waiter
+  is still released (cancellation then propagates), so the Session cannot wedge.
+  That fallback first latches an error outcome through the same
+  `on_terminal_result` chokepoint. Otherwise a failed error settle would
+  terminalize the Turn as completed.
+- The settle carries the outcome frozen on the record when it is classified.
+  That outcome uses `_terminal_backend_failure`, the predicate that already
+  selects detached result text. A Result that fails only through `is_error`,
+  `error`, `errors`, `api_error_status`, or a `failed` subtype therefore ends
+  its Turn as failed, not completed.
+- The settle awaits delivery while the owner is already retired but the gate
+  is still held. Output reaching the receiver in that window belongs to the
+  next Turn. It waits for the settlement, then opens that Turn normally.
+  Classifying the output against the held gate would instead make it a
+  detached record that is delivered outside any Turn.
+- A silent-only detached reply settles its Activity claim without creating a
+  Message. A missing receipt for such a reply is success, not a delivery
+  failure, so it no longer retries forever ahead of every later record.

@@ -22,6 +22,7 @@ from core.native_dispatch_phase import mark_backend_dispatch_attempted, mark_pre
 from core.processing_indicator import STOPPED_REACTION_EMOJI
 from core.reply_enhancer import strip_silent_blocks
 from core.resource_governance import pids_failure_labels
+from core.run_settlement import SETTLED_BY_TURN_ONLY_RESULT
 from core.runtime_activation import RuntimeActivationIdentity, RuntimeActivationRegistry
 from core.runtime_work import RuntimeWorkLane
 from core.services.agent_steering import (
@@ -88,6 +89,7 @@ class _ClaudeOutputRecoveryRecord:
     request: AgentRequest | None = None
     context: MessageContext | None = None
     subtype: str = "success"
+    is_error: bool = False
     duration_ms: int = 0
     delivering: bool = False
     provenance: str | None = None
@@ -162,6 +164,7 @@ class ClaudeAgent(BaseAgent):
         self._detached_foreground_tool_use_ids: dict[str, set[str]] = {}
         self._detached_foreground_task_ids: dict[str, set[str]] = {}
         self._synthetic_pending_owners: dict[str, AgentRequest] = {}
+        self._synthetic_owner_settlements: dict[str, asyncio.Event] = {}
         self._provenance_recovery_evidence: dict[str, dict[str, object]] = {}
 
         # Question handler for AskUserQuestion support (disabled)
@@ -317,6 +320,10 @@ class ClaudeAgent(BaseAgent):
         record.context = self._snapshot_output_context(context)
         record.provenance = self._result_origin_kind(message)
         record.subtype = str(getattr(message, "subtype", "success") or "")
+        record.is_error = (
+            self._terminal_backend_failure(message, getattr(message, "result", None))
+            is not None
+        )
         record.duration_ms = getattr(message, "duration_ms", 0)
         if record.output is None:
             record.output = self._unsolicited_message_output(message, phase_id=record.phase_id)
@@ -3747,14 +3754,21 @@ class ClaudeAgent(BaseAgent):
             return []
         return list(getattr(request, "output_activities", None) or [])
 
-    def _retire_synthetic_pending_owner(
+    async def _retire_synthetic_pending_owner(
         self,
         composite_key: str,
         context: MessageContext,
         *,
         owner: AgentRequest | None,
+        is_error: bool = False,
     ) -> bool:
-        """Release this output's captured owner, never the current runtime owner."""
+        """Release this output's captured owner, never the current runtime owner.
+
+        Detached output never completes a Turn, so retirement is the synthetic
+        owner's terminal boundary: it ends the agent-initiated Turn through the
+        canonical silent result before the gate opens for the next Turn. The
+        Run, if any, stays with the detached output that already settled it.
+        """
 
         synthetic = owner
         if (
@@ -3779,9 +3793,44 @@ class ClaudeAgent(BaseAgent):
             self._pop_pending_request(composite_key)
         self._clear_request_activities(synthetic)
         self._mark_session_idle_if_no_pending_requests(composite_key)
-        self._release_service_runtime_turn(
-            getattr(synthetic, "context", None) or context
-        )
+        owner_context = getattr(synthetic, "context", None) or context
+        # Output arriving while this Turn settles belongs to the next Turn. The
+        # receiver waits here rather than classifying it against a gate that
+        # this settling Turn still holds.
+        settled = asyncio.Event()
+        self._synthetic_owner_settlements[composite_key] = settled
+        try:
+            await self.controller.emit_agent_message(
+                owner_context,
+                "result",
+                "",
+                is_error=is_error,
+                output=MessageOutput(completes_turn=True, completes_run=False),
+            )
+        except BaseException as exc:
+            # No backend result will ever arrive for this Turn again and its
+            # record is already gone, so a failed or cancelled settle must still
+            # latch its outcome and release its waiter rather than wedge the
+            # Session.
+            if isinstance(exc, Exception):
+                logger.warning(
+                    "Agent-initiated turn settle failed for %s", composite_key, exc_info=True,
+                )
+            latch = getattr(
+                getattr(self.controller, "session_turns", None), "on_terminal_result", None,
+            )
+            if is_error and callable(latch):
+                latch(owner_context, is_error=True, settled_by=SETTLED_BY_TURN_ONLY_RESULT)
+            mark = getattr(self.controller, "mark_turn_complete", None)
+            if callable(mark):
+                mark(owner_context, settled_by=SETTLED_BY_TURN_ONLY_RESULT)
+            if not isinstance(exc, Exception):
+                raise
+        finally:
+            self._release_service_runtime_turn(owner_context)
+            if self._synthetic_owner_settlements.get(composite_key) is settled:
+                self._synthetic_owner_settlements.pop(composite_key, None)
+            settled.set()
         return True
 
     def _has_synthetic_delivery_pending(self, composite_key: str) -> bool:
@@ -5225,7 +5274,9 @@ class ClaudeAgent(BaseAgent):
                         subtype=record.subtype, duration_ms=record.duration_ms,
                         parse_mode="markdown", output=record.output,
                     )
-                    if message_id is None:
+                    # A silent-only reply settles without a Message, so it has no
+                    # receipt; retrying it would block every later record.
+                    if message_id is None and strip_silent_blocks(record.text).strip():
                         raise ActivityOutputDeliveryError(
                             "Claude detached output was not accepted", delivered=False,
                         )
@@ -5255,7 +5306,12 @@ class ClaudeAgent(BaseAgent):
             finally:
                 record.delivering = False
             self._remove_output_record(record)
-            self._retire_synthetic_pending_owner(composite_key, context, owner=record.request)
+            await self._retire_synthetic_pending_owner(
+                composite_key,
+                context,
+                owner=record.request,
+                is_error=record.is_error,
+            )
         self._mark_session_idle_if_runtime_free(composite_key)
         self._signal_activity_output_settled(composite_key)
         # Another Result can append a record while this batch is in flight.
@@ -5602,6 +5658,9 @@ class ClaudeAgent(BaseAgent):
         agent-initiated Turn and synthesize a pending ``AgentRequest`` so the
         existing result path retains its normal lifecycle behavior.
         """
+        settling = self._synthetic_owner_settlements.get(composite_key)
+        if settling is not None:
+            await settling.wait()
         registry = self._activity_registry()
         pending = self._pending_requests.get(composite_key) or []
         defer_activity_claim = message_type == "result" and (
