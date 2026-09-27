@@ -5,6 +5,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::DateTime;
 use serde::Deserialize;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use url::Url;
 
@@ -16,6 +18,8 @@ const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_DETAIL_BYTES: usize = 256 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_DETAIL_LOOKUPS: usize = 16;
+const MAX_PENDING_LOOKUPS: usize = 64;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct SseFrame {
@@ -127,7 +131,9 @@ impl NotificationGate {
 
 pub trait NotificationSink: Send + Sync {
     fn gate(&self) -> NotificationGate;
-    fn deliver(&self, intent: NotificationIntent);
+    /// `source` names where a run happened ("Project · Session"), already
+    /// sanitized by [`RunDetail::source`]; `None` keeps the generic copy.
+    fn deliver(&self, intent: NotificationIntent, source: Option<String>);
 }
 
 #[derive(Default)]
@@ -212,6 +218,81 @@ impl RunTimestamps {
     }
 }
 
+/// The run detail the shell reads back after a terminal event: the stamps
+/// that decide whether it is background work, plus the labels that say where
+/// it ran. Every label is Runtime text on its way to an OS surface, so it only
+/// leaves through [`RunDetail::source`].
+#[derive(Clone, Default, Deserialize)]
+pub struct RunDetail {
+    #[serde(flatten)]
+    pub stamps: RunTimestamps,
+    pub session_project_name: Option<String>,
+    pub session_label: Option<String>,
+    pub definition_name: Option<String>,
+}
+
+const SOURCE_PART_CHARS: usize = 48;
+
+/// Invisible formatting a single-line title has no use for: bidi marks,
+/// embeddings, overrides and isolates (which let a label render its own text
+/// backwards), zero-width space, word joiner, BOM, and the private-use area.
+/// ZWNJ, ZWJ and variation selectors stay: they spell real words and emoji and
+/// cannot reorder text. Same set as `core/citations.py::_CONTROL_RE`.
+fn is_invisible_format(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200b}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+            | '\u{e000}'..='\u{f8ff}'
+    )
+}
+
+fn clean_label(value: Option<&str>) -> Option<String> {
+    let words = value?
+        .chars()
+        .filter(|character| !is_invisible_format(*character))
+        .map(|character| {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let collapsed = words.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() <= SOURCE_PART_CHARS {
+        return Some(collapsed);
+    }
+    let mut truncated = collapsed.chars().take(SOURCE_PART_CHARS - 1).collect::<String>();
+    truncated.truncate(truncated.trim_end().len());
+    truncated.push('…');
+    Some(truncated)
+}
+
+impl RunDetail {
+    /// "Project · Session" for a Workbench session, the channel for an IM
+    /// session, and the task or watch name when no session resolved. Control
+    /// characters and invisible bidi/zero-width formatting are removed,
+    /// whitespace collapsed, and each part bounded.
+    pub fn source(&self) -> Option<String> {
+        let project = clean_label(self.session_project_name.as_deref());
+        let place = clean_label(self.session_label.as_deref()).or_else(|| clean_label(self.definition_name.as_deref()));
+        match (project, place) {
+            (Some(project), Some(place)) if project != place => Some(format!("{project} · {place}")),
+            (project, place) => place.or(project),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct RunEvent {
     run_id: String,
@@ -222,11 +303,14 @@ struct RunEvent {
 }
 
 enum Candidate {
-    Ready(NotificationIntent),
-    Refetch {
+    Approval,
+    Run {
         run_id: String,
         stamps: RunTimestamps,
         intent: NotificationIntent,
+        /// Already background work by type or by the event's own stamps; the
+        /// detail read only supplies the source label.
+        background: bool,
     },
 }
 
@@ -251,7 +335,7 @@ impl NotificationFilter {
             return self
                 .approvals
                 .insert(&approval.request_id, now)
-                .then_some(Candidate::Ready(NotificationIntent::ApprovalRequested));
+                .then_some(Candidate::Approval);
         }
         let run: RunEvent = serde_json::from_value(envelope.data).ok()?;
         if run.run_id.is_empty() {
@@ -266,13 +350,12 @@ impl NotificationFilter {
         if !self.runs.insert(&run.run_id, now) {
             return None;
         }
-        if matches!(run.run_type.as_deref(), Some("scheduled" | "watch")) || run.stamps.is_long_running() {
-            return Some(Candidate::Ready(intent));
-        }
-        run.stamps.missing().then_some(Candidate::Refetch {
+        let background = matches!(run.run_type.as_deref(), Some("scheduled" | "watch")) || run.stamps.is_long_running();
+        (background || run.stamps.missing()).then_some(Candidate::Run {
             run_id: run.run_id,
             stamps: run.stamps,
             intent,
+            background,
         })
     }
 }
@@ -288,7 +371,7 @@ pub struct StreamError;
 #[async_trait]
 pub trait NotificationTransport: Send + Sync {
     async fn connect(&self) -> Result<Box<dyn EventStream>, StreamError>;
-    async fn run_timestamps(&self, run_id: &str) -> Option<RunTimestamps>;
+    async fn run_detail(&self, run_id: &str) -> Option<RunDetail>;
 }
 
 pub struct HttpNotificationTransport {
@@ -356,7 +439,7 @@ impl NotificationTransport for HttpNotificationTransport {
         Ok(Box::new(HttpEventStream(response)))
     }
 
-    async fn run_timestamps(&self, run_id: &str) -> Option<RunTimestamps> {
+    async fn run_detail(&self, run_id: &str) -> Option<RunDetail> {
         if matches!(run_id, "" | "." | "..") {
             return None;
         }
@@ -410,11 +493,16 @@ impl ReconnectBackoff {
 }
 
 pub async fn run_notifications(
-    transport: &dyn NotificationTransport,
+    transport: Arc<dyn NotificationTransport>,
     filter: Arc<Mutex<NotificationFilter>>,
-    sink: &dyn NotificationSink,
+    sink: Arc<dyn NotificationSink>,
 ) {
     let mut backoff = ReconnectBackoff::default();
+    // Detail reads run beside the stream, never inside it: a slow read must
+    // not hold back the next chunk (and the approval it may carry). Dropping
+    // the set with this future aborts whatever is still in flight.
+    let mut lookups = JoinSet::new();
+    let slots = Arc::new(Semaphore::new(MAX_DETAIL_LOOKUPS));
     loop {
         let connected_at = Instant::now();
         if let Ok(mut stream) = transport.connect().await {
@@ -423,43 +511,79 @@ pub async fn run_notifications(
                 if Instant::now().duration_since(connected_at) >= STREAM_IDLE_TIMEOUT {
                     backoff.reset();
                 }
+                while lookups.try_join_next().is_some() {}
+                // Suppression is not a queue: frames still reach the filter so
+                // its de-duplication stays current, then are dropped.
                 let allowed_at_receipt = sink.gate().allows();
-                let candidates = decoder
-                    .push(&chunk)
-                    .into_iter()
-                    .filter_map(|frame| {
-                        filter
-                            .lock()
-                            .ok()
-                            .and_then(|mut filter| filter.consider(frame, Instant::now()))
-                    })
-                    .collect::<Vec<_>>();
-                for candidate in candidates.into_iter().filter(|_| allowed_at_receipt) {
-                    let intent = match candidate {
-                        Candidate::Ready(intent) => Some(intent),
-                        Candidate::Refetch {
+                for frame in decoder.push(&chunk) {
+                    let candidate = filter
+                        .lock()
+                        .ok()
+                        .and_then(|mut filter| filter.consider(frame, Instant::now()))
+                        .filter(|_| allowed_at_receipt);
+                    match candidate {
+                        None => {}
+                        Some(Candidate::Approval) => {
+                            if sink.gate().allows() {
+                                sink.deliver(NotificationIntent::ApprovalRequested, None);
+                            }
+                        }
+                        Some(Candidate::Run {
                             run_id,
-                            mut stamps,
+                            stamps,
                             intent,
-                        } => {
-                            if !sink.gate().allows() {
+                            background,
+                        }) => {
+                            while lookups.try_join_next().is_some() {}
+                            if lookups.len() >= MAX_PENDING_LOOKUPS {
+                                // Overloaded: the backlog is bounded. Work the
+                                // event already qualifies notifies now with
+                                // generic copy; a run only its read could
+                                // qualify fails closed.
+                                if background && sink.gate().allows() {
+                                    sink.deliver(intent, None);
+                                }
                                 continue;
                             }
-                            if let Ok(Some(detail)) =
-                                tokio::time::timeout(REQUEST_TIMEOUT, transport.run_timestamps(&run_id)).await
-                            {
-                                stamps.fill_missing(detail);
-                            }
-                            stamps.is_long_running().then_some(intent)
+                            let (transport, sink, slots) = (transport.clone(), sink.clone(), slots.clone());
+                            lookups.spawn(async move {
+                                // Queue behind the request limit rather than
+                                // drop: a run without stamps is only decided
+                                // by its read.
+                                let Ok(_slot) = slots.acquire_owned().await else {
+                                    return;
+                                };
+                                notify_run(transport, sink, run_id, stamps, intent, background).await;
+                            });
                         }
-                    };
-                    if let Some(intent) = intent.filter(|_| sink.gate().allows()) {
-                        sink.deliver(intent);
                     }
                 }
             }
         }
         tokio::time::sleep(backoff.next_delay()).await;
+    }
+}
+
+/// One bounded read per terminal run: it names the source and, when the event
+/// lacked stamps, decides whether the run was background work at all.
+async fn notify_run(
+    transport: Arc<dyn NotificationTransport>,
+    sink: Arc<dyn NotificationSink>,
+    run_id: String,
+    mut stamps: RunTimestamps,
+    intent: NotificationIntent,
+    background: bool,
+) {
+    let detail = tokio::time::timeout(REQUEST_TIMEOUT, transport.run_detail(&run_id))
+        .await
+        .ok()
+        .flatten();
+    let source = detail.as_ref().and_then(RunDetail::source);
+    if let Some(detail) = detail {
+        stamps.fill_missing(detail.stamps);
+    }
+    if (background || stamps.is_long_running()) && sink.gate().allows() {
+        sink.deliver(intent, source);
     }
 }
 
