@@ -242,6 +242,17 @@ files do). A page that does not, or cannot answer, gets the standard title bar
 with the window title, the strip hidden, and the inset reset to `0px`. Windows
 and Linux keep the native title bar and a zero inset.
 
+Links that ask for a new browsing context (`target="_blank"` or
+`window.open`) open in the system browser when they are `http(s)`; anything
+else is dropped, and the page never gets a second webview. WKWebView first
+offers a `target="_blank"` click to the navigation policy, which only lets the
+window itself stay on the shell and Runtime origins, so on macOS the shell
+answers that step natively (`src/macos_new_context.rs`): a request whose
+WebKit `targetFrame` is nil and whose destination is `http(s)` is allowed on to
+the `on_new_window` handler. The decision reads WebKit's own navigation action,
+so it holds for links in frames and under page handlers, injects nothing into
+the page, and leaves every in-window navigation to the unchanged policy.
+
 For manual acceptance, use a packaged test install with isolated app config and
 a fake loopback Runtime: set a non-default frame, quit/relaunch, hide/Open, and
 deliver a link both before and after readiness. Check the destination and frame,

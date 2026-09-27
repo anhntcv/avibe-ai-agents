@@ -26,6 +26,8 @@ mod updater;
 #[cfg(target_os = "macos")]
 mod macos_deep_link;
 #[cfg(target_os = "macos")]
+mod macos_new_context;
+#[cfg(target_os = "macos")]
 mod macos_title_bar;
 
 use avibe_runtime_host::deep_link::{DeepLinkNavigation, DeepLinks};
@@ -1208,7 +1210,10 @@ fn ensure_main_window(app: &AppHandle) -> Option<WebviewWindow> {
     let builder = builder.initialization_script(macos_title_bar::inset_script());
     let window = builder.build().ok()?;
     #[cfg(target_os = "macos")]
-    macos_title_bar::install(&window);
+    {
+        macos_title_bar::install(&window);
+        macos_new_context::install(&window);
+    }
     Some(window)
 }
 
