@@ -2816,6 +2816,7 @@ class _FixtureInstaller:
             "installed": True,
             "version": "v7.2.95",
             "install_dir": str(self.install_dir),
+            "path": str(self.binary),
         }
 
     def resolve_engine_path(self):
@@ -3329,7 +3330,7 @@ def test_supervisor_refuses_an_engine_whose_identity_was_not_captured(
 ) -> None:
     from vibe.model_hub_runtime import supervisor as supervisor_module
 
-    monkeypatch.setattr(supervisor_module, "capture_spawned_process_identity", lambda *_: None)
+    monkeypatch.setattr(supervisor_module, "capture_spawned_process_identity", lambda *_, **__: None)
     supervisor, store = _fixture_supervisor(tmp_path)
 
     with pytest.raises(EngineUnavailableError):
@@ -3667,7 +3668,7 @@ def test_supervisor_failed_tracking_reaps_a_descendant_that_ignores_sigterm(
         time.sleep(0.5)
         return process
 
-    monkeypatch.setattr(supervisor_module, "capture_spawned_process_identity", lambda *_: None)
+    monkeypatch.setattr(supervisor_module, "capture_spawned_process_identity", lambda *_, **__: None)
     supervisor, store = _fixture_supervisor(tmp_path, process_factory=spawn)
 
     with pytest.raises(EngineUnavailableError) as raised:
@@ -4611,6 +4612,7 @@ def test_runtime_install_state_survives_adapter_reload_and_settles_once(
                 "installed": installed,
                 "version": "v7.2.95" if installed else None,
                 "install_dir": str(self.binary.parent),
+                "path": str(self.binary) if installed else None,
                 "platform": self.host_platform(),
                 "reason": None,
             }
@@ -4710,6 +4712,7 @@ def test_cancelled_install_admission_keeps_owned_worker_and_shutdown_joins_it(
                 "installed": installed,
                 "version": "v7.2.95" if installed else None,
                 "install_dir": str(self.binary.parent),
+                "path": str(self.binary) if installed else None,
                 "platform": self.host_platform(),
                 "reason": None,
             }
@@ -4788,6 +4791,7 @@ def test_install_finalization_never_projects_a_verified_installing_state(
                 "installed": installed,
                 "version": "v7.2.95" if installed else None,
                 "install_dir": str(self.binary.parent),
+                "path": str(self.binary) if installed else None,
                 "platform": self.host_platform(),
                 "reason": None,
             }
@@ -4867,6 +4871,7 @@ def test_orphaned_install_state_is_reclaimed_before_runtime_status(
                 "installed": installed,
                 "version": "v7.2.95" if installed else None,
                 "install_dir": str(self.binary.parent),
+                "path": str(self.binary) if installed else None,
                 "platform": self.host_platform(),
                 "reason": None,
             }
@@ -4956,6 +4961,7 @@ def test_recovery_retries_a_transient_shared_install_lock_collision(
                 "installed": installed,
                 "version": "v7.2.95" if installed else None,
                 "install_dir": str(self.binary.parent),
+                "path": str(self.binary) if installed else None,
                 "platform": self.host_platform(),
                 "reason": None,
             }
@@ -5257,6 +5263,7 @@ def test_runtime_start_after_install_obeys_latest_explicit_lifecycle_action(
                 "installed": installed,
                 "version": "v7.2.95" if installed else None,
                 "install_dir": str(self.binary.parent),
+                "path": str(self.binary) if installed else None,
                 "platform": self.host_platform(),
                 "reason": None,
             }
@@ -6758,8 +6765,10 @@ def test_closing_an_unstarted_stream_publishes_an_observed_terminal(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("code", [28, 24, None])
 def test_stream_replay_failure_preserves_observed_usage(
     monkeypatch: pytest.MonkeyPatch,
+    code: int | None,
 ) -> None:
     async def run() -> None:
         class FailingPrelude(client_module._StreamPrelude):
@@ -6767,7 +6776,7 @@ def test_stream_replay_failure_preserves_observed_usage(
                 super().__init__(memory_limit=1)
 
             def write(self, data: bytes) -> None:
-                raise OSError("temporary storage unavailable")
+                raise OSError(code, "private temporary storage unavailable", "/private/凭证")
 
         first = (
             b'event: message_start\ndata: {"type":"message_start","message":'
@@ -6820,6 +6829,7 @@ def test_stream_replay_failure_preserves_observed_usage(
         outcome = await handle.outcome()
         assert outcome.kind is RawOutcomeKind.NETWORK_ERROR
         assert outcome.error_code == "engine_down"
+        assert outcome.os_errno == code
         assert outcome.usage == ProtocolUsageReport.of(
             input_tokens=77,
             cached_input_tokens=0,
