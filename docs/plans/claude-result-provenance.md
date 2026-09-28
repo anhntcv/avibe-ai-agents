@@ -136,7 +136,7 @@ and native-input receipts, not a second human terminal state machine.
 | External acceptance but failed local settlement without durable Message evidence | Keep the claim and original payload; refine only the record's retry policy to the dispatcher's existing local-settlement-only path. Never resend externally. |
 | Durable delivery and local settlement | Retire that record and only its captured synthetic Request/token. An unrelated current synthetic or human owner is untouched. |
 | EOF/error/Stop/replacement | Retire exactly the dead client. Frozen records survive; provisional detached records from that generation are conservatively frozen without borrowing replacement provenance. |
-| Activity classification | Update lineage and notify the Run owner without deleting awaiting/claimed output receipts. |
+| Activity classification | Update lineage and notify the Run owner of background terminals without deleting awaiting/claimed output receipts; a foreground terminal only acknowledges its snapshot (2026-09-28). |
 | Terminal-snapshot acknowledgement | Delete only an indexed terminal snapshot, after Run-owner acceptance. Force-ended snapshots remain indexed until acknowledgement. |
 
 The existing admission fence is consulted before Result classification/replay,
@@ -161,8 +161,10 @@ have a reachable drain/ack path.
 The managed worker rechecks the ledger after awaited delivery: a Result appended
 during a retry remains its responsibility even if the initial list was drained.
 There is no new generic queue, service, or per-output timer. Missing/unknown
-origin with competing Activity remains conservative; foreground execution mode
-and TaskStarted linkage are still not human-provenance evidence.
+origin with competing Activity remains conservative; while ownership is
+contested, foreground execution mode and TaskStarted linkage are still not
+human-provenance evidence. The uncontested live case is covered in the
+2026-09-28 section.
 
 Consumer coverage includes event-held native streams; old payload plus later
 failure and human phases; human and synthetic successor admission; Stop-first
@@ -283,3 +285,65 @@ human input queued behind the Turn indefinitely.
 - A silent-only detached reply settles its Activity claim without creating a
   Message. A missing receipt for such a reply is success, not a delivery
   failure, so it no longer retries forever ahead of every later record.
+
+## Uncontested live phases and steer boundaries (2026-09-28)
+
+A long foreground command made a human Turn look stuck. Take this stream:
+`Bash(sleep 600)` is emitted live, its `TaskStarted` arrives, and the model
+keeps working. Every `TaskStarted` opened the provenance barrier, so each later
+Assistant and tool frame of that Turn was buffered until the terminal Result.
+The Web UI showed nothing for the rest of the Turn. If a steer receipt arrived
+while frames were buffered, the receipt boundary cleared the buffer and its
+provisional facts without replaying them. Those frames were lost, and the
+pre-steer Activities stayed provisional snapshots that kept competing.
+
+- A live frame is emitted only when nothing competes with the pending human
+  request, so the receiver has already attributed it to that request. A
+  foreground task whose parent tool is such a frame inherits the frame's owner
+  when all of these hold: the tool is still recorded as a live foreground tool,
+  no frame is buffered, no competing Activity or output record exists, and the
+  pending request is a real human request. The Activity starts with that Turn,
+  Run, and delivery identity and `provenance_human`, so it does not compete, and
+  later frames of the phase stay live. If any condition fails, the task is
+  provisional as before.
+- Only foreground tools qualify. A foreground completion has no Activity output
+  that a Result could claim, and its terminal follows the existing
+  non-provisional foreground owner: the Turn's Result settles the Run. A
+  background tool's completion creates queued output, and the Activity flush can
+  complete a Turn from it. Background tools therefore stay provisional until the
+  Result classifies their phase, even when their frame was live. Foreground
+  follows each tool's real default through the shared tool policy
+  (`runs_in_background`): an `Agent` call without `run_in_background` is a
+  background subagent, while a `Bash` call without it is foreground.
+- A foreground task is one step of its Turn, and the agent can recover from a
+  failed step. Its terminal never settles the Run on either path: the Turn's
+  Result owns the Run outcome. Previously a foreground task that stayed
+  provisional behind competing output was handed to the Run owner once the
+  human Result classified it, so a failed, stopped, or killed step made the Run
+  fail or cancel immediately and stickily, even when the Turn then succeeded.
+  The same stream settled differently depending on whether unrelated output
+  happened to compete. Classification now only acknowledges such a foreground
+  terminal snapshot; classified background terminals still notify the Run
+  owner, which `Activity classification` below describes.
+- When a steer receipt arrives while frames are buffered, no Result separates
+  those frames from the steer, so Claude consumed the steer within the same
+  turn. The receiver appends a steer-boundary marker and keeps the frames and
+  their provisional facts for the one terminal Result that classifies both
+  sides. A human Result replays the frames and emits the pre-steer text at the
+  marker as non-terminal primary output, the same shape as a live steer
+  boundary. Foreground-tool evidence is phase-local there too: the marker
+  retires the pre-steer evidence, so a post-steer Result without its own
+  Assistant text keeps its result text instead of the silent tool-only
+  sentinel. A detached Result ignores the marker and keeps the pending request.
+  Without buffered frames, the existing live boundary behavior is unchanged.
+- Replay is ordered. Once a phase has a buffered frame, every later frame of
+  that phase is buffered too, even if the competing output finishes first. A
+  later frame therefore cannot overtake earlier held frames, and replay after
+  the marker re-derives exactly the evidence that belongs after the boundary.
+
+Consumer tests cover the uncontested live task, a competing Activity that
+appears before `TaskStarted`, a default-background `Agent` task, and human or
+detached classification of buffered frames across a steer boundary, including a
+post-steer Result with no Assistant frame and competition that ends after the
+steer. They are hermetic receiver tests, not native SDK or Web/IM end-to-end
+tests.
