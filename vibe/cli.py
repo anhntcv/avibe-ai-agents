@@ -83,22 +83,30 @@ from vibe.upgrade import (
     atomic_upgrade_lock,
     build_upgrade_plan,
     cache_running_vibe_path,
+    current_generation,
     execute_upgrade_plan,
     defer_upgrade_activation,
+    generation_downgrade,
     get_latest_version_info,
     get_safe_cwd,
     is_desktop_managed_runtime,
     _launcher_generation,
     _candidate_python,
     launcher_is_current_process,
+    move_managed_launcher_locked,
+    newest_launcher_selection,
+    process_generation,
     restart_is_pending,
     restart_record_is_pending,
     discard_atomic_uv_install_generation,
     should_skip_show_runtime_prepare,
+    stable_launcher_selections,
+    top_ranked_selections,
     UPGRADE_INSTALL_TIMEOUT_SECONDS,
     verify_upgrade_candidate,
 )
 from storage.db import create_sqlite_engine
+from storage.lock import MigrationLockTimeout
 from storage.background import (
     DefinitionWriteConflict,
     SQLiteBackgroundTaskStore,
@@ -126,9 +134,12 @@ _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _FALSY_ENV_VALUES = {"0", "false", "no", "off"}
 DOCTOR_RESTART_RESULT_RETENTION_SECONDS = 10 * 60
 DOCTOR_RESTART_SEED_GRACE_SECONDS = 60.0
+DOCTOR_LAUNCHER_REPAIR_LOCK_TIMEOUT_SECONDS = 10.0
+STABLE_LAUNCHER_REPAIR_ARGS = ("doctor", "repair", "stable-launchers")
 DOCTOR_REPAIR_TARGETS = (
     "home-migration",
     "stale-install-runtime",
+    "stable-launchers",
     "duplicate-service-processes",
     "stale-restart-state",
     "askill",
@@ -138,8 +149,8 @@ DOCTOR_REPAIR_TARGETS = (
     "show-runtime",
     "tmux",
 )
-DOCTOR_DEFAULT_REPAIR_TARGETS = DOCTOR_REPAIR_TARGETS[:4]
-DOCTOR_DEPENDENCY_REPAIR_TARGETS = frozenset(DOCTOR_REPAIR_TARGETS[4:])
+DOCTOR_DEFAULT_REPAIR_TARGETS = DOCTOR_REPAIR_TARGETS[:5]
+DOCTOR_DEPENDENCY_REPAIR_TARGETS = frozenset(DOCTOR_REPAIR_TARGETS[5:])
 
 
 def _doctor_repair_target(value: str) -> str:
@@ -154,6 +165,7 @@ def _doctor_repair_target(value: str) -> str:
 DOCTOR_REPAIR_DRY_RUN_I18N_KEYS = {
     "home-migration": "doctor.repair.dryHomeMigration",
     "stale-install-runtime": "doctor.repair.dryStaleInstall",
+    "stable-launchers": "doctor.repair.dryStableLaunchers",
     "duplicate-service-processes": "doctor.repair.dryDuplicateProcesses",
     "stale-restart-state": "doctor.repair.dryStaleRestart",
     "askill": "doctor.repair.dryAskill",
@@ -1156,6 +1168,43 @@ def _current_cli_install_family() -> str | None:
         if family:
             return family
     return None
+
+
+def _launcher_command(launcher: Path | str, *args: str) -> str:
+    """A pasteable command that runs ``launcher``, even from a path with spaces."""
+
+    return shlex.join([str(launcher), *args])
+
+
+def _service_generation_items() -> list[dict]:
+    """Warn when the running service is older than the last activated install."""
+
+    items: list[dict] = []
+    owner_pid = runtime.resolve_service_owner_pid(include_starting=False)
+    downgrade = generation_downgrade(process_generation(owner_pid)) if owner_pid else None
+    if downgrade is None:
+        return items
+    language = _configured_cli_language()
+    _add_doctor_item(
+        items,
+        "warn",
+        i18n_t(
+            "doctor.item.serviceGenerationBehind",
+            language,
+            version=downgrade.version,
+            generation=downgrade.generation,
+            activatedVersion=downgrade.activated.version,
+            activatedGeneration=downgrade.activated.generation,
+        ),
+        i18n_t(
+            "doctor.action.serviceGenerationBehind",
+            language,
+            restartCommand=_launcher_command(downgrade.activated.launcher, "restart"),
+        ),
+        code="runtime.service_generation_behind",
+        generation_downgrade=downgrade.as_dict(),
+    )
+    return items
 
 
 def _service_install_family_items(*, detect_extra_processes: bool = True) -> list[dict]:
@@ -12412,6 +12461,7 @@ def _doctor(*, deep: bool = False):
     for item in [
         *_service_lifecycle_items(detect_extra_processes=deep),
         *_service_install_family_items(detect_extra_processes=deep),
+        *_service_generation_items(),
         *_restart_state_items(),
         *_runtime_architecture_items(),
         *_show_git_checkpoint_items(),
@@ -12434,7 +12484,7 @@ def _doctor(*, deep: bool = False):
             summary[status] += 1
     groups.append({"name": i18n_t("doctor.group.dependencies", language), "items": dependency_items})
 
-    local_cli_items = _local_cli_installation_items()
+    local_cli_items = [*_stable_launcher_items(), *_local_cli_installation_items()]
     for item in local_cli_items:
         status = item.get("status")
         if status in summary:
@@ -12642,6 +12692,73 @@ def _current_sqlite_revision() -> str | None:
     if not row or not row[0]:
         return None
     return str(row[0])
+
+
+def _describe_launcher_selections(selections: list, language: str) -> str:
+    unknown = i18n_t("doctor.value.unknown", language)
+    return "; ".join(
+        f"{selection.launcher} -> {selection.version or unknown} ({selection.generation})"
+        for selection in selections
+    )
+
+
+def _stable_launcher_items() -> list[dict]:
+    """Fail when two discoverable stable launchers select different installs."""
+
+    items: list[dict] = []
+    language = _configured_cli_language()
+    selections = stable_launcher_selections()
+    if len(selections) < 2:
+        return items
+    unknown = i18n_t("doctor.value.unknown", language)
+    if len({selection.generation for selection in selections}) == 1:
+        _add_doctor_item(
+            items,
+            "pass",
+            i18n_t(
+                "doctor.item.launchersInStep",
+                language,
+                count=len(selections),
+                version=selections[0].version or unknown,
+            ),
+            code="installation.stable_launchers",
+        )
+        return items
+    target = newest_launcher_selection(selections)
+    _add_doctor_item(
+        items,
+        "fail",
+        i18n_t(
+            "doctor.item.splitLaunchers",
+            language,
+            launchers=_describe_launcher_selections(selections, language),
+        ),
+        i18n_t(
+            "doctor.action.splitLaunchersTied",
+            language,
+            launchers=_describe_launcher_selections(top_ranked_selections(selections), language),
+        )
+        if target is None
+        else i18n_t(
+            "doctor.action.splitLaunchers",
+            language,
+            repairCommand=_launcher_command(target.launcher, *STABLE_LAUNCHER_REPAIR_ARGS),
+            version=target.version or unknown,
+        ),
+        code="installation.split_launchers",
+        # Tied installs leave the repair nothing to choose, so doctor does not offer it.
+        repair_target=None if target is None else "stable-launchers",
+        repair_risk="low",
+        launchers=[
+            {
+                "path": str(selection.launcher),
+                "version": selection.version,
+                "generation": str(selection.generation),
+            }
+            for selection in selections
+        ],
+    )
+    return items
 
 
 def _local_cli_installation_items() -> list[dict]:
@@ -13051,6 +13168,136 @@ def _repair_duplicate_service_processes(*, dry_run: bool = False) -> dict:
     )
 
 
+def _repair_stable_launchers(*, dry_run: bool = False) -> dict:
+    """Point every managed stable launcher at the newest installed generation."""
+
+    target_name = "stable-launchers"
+    language = _configured_cli_language()
+
+    def in_step(selections: list) -> dict | None:
+        if len({selection.generation for selection in selections}) < 2:
+            return _doctor_repair_result(
+                target_name, "skipped", i18n_t("doctor.repair.stableLaunchersInStep", language)
+            )
+        return None
+
+    # Launchers already in step need no lock; taking it would create the
+    # home of an install that has none.
+    if (skipped := in_step(stable_launcher_selections())) is not None:
+        return skipped
+    if dry_run:
+        return _doctor_repair_result(target_name, "planned", i18n_t("doctor.repair.dryStableLaunchers", language))
+    try:
+        with atomic_upgrade_lock(timeout_seconds=DOCTOR_LAUNCHER_REPAIR_LOCK_TIMEOUT_SECONDS):
+            selections = stable_launcher_selections()
+            if (skipped := in_step(selections)) is not None:
+                return skipped
+            target = newest_launcher_selection(selections)
+            if target is None:
+                # Discovery order must never pick between tied installs.
+                return _doctor_repair_result(
+                    target_name,
+                    "failed",
+                    i18n_t(
+                        "doctor.repair.stableLaunchersTied",
+                        language,
+                        launchers=_describe_launcher_selections(top_ranked_selections(selections), language),
+                    ),
+                    reason="stable_launchers_tied",
+                )
+            unknown = i18n_t("doctor.value.unknown", language)
+            moved: list[Path] = []
+            running = None
+            for selection in selections:
+                if selection.generation == target.generation:
+                    continue
+                # Windows cannot replace the image this repair runs from. The
+                # target launcher is not running, so it can move this one.
+                if launcher_is_current_process(selection.launcher):
+                    running = selection
+                    continue
+                # A managed launcher has its export's name, so the target
+                # install exports the same name (see managed_stable_launchers).
+                exported = target.generation / "bin" / selection.launcher.name
+                try:
+                    # A launcher another installer replaced since discovery is left alone.
+                    if move_managed_launcher_locked(selection.launcher, selection.generation, exported):
+                        moved.append(selection.launcher)
+                except (OSError, RuntimeError) as exc:
+                    logger.warning("failed to repoint stable launcher %s", selection.launcher, exc_info=True)
+                    return _doctor_repair_result(
+                        target_name,
+                        "failed",
+                        i18n_t(
+                            "doctor.repair.stableLauncherMoveFailed",
+                            language,
+                            launcher=selection.launcher,
+                            version=target.version or unknown,
+                            generation=target.generation,
+                        ),
+                        reason="stable_launcher_move_failed",
+                        error=str(exc),
+                        launchers=[str(launcher) for launcher in moved],
+                    )
+            if running is not None:
+                return _doctor_repair_result(
+                    target_name,
+                    "failed",
+                    i18n_t(
+                        "doctor.repair.stableLauncherRunning",
+                        language,
+                        launcher=running.launcher,
+                        repairCommand=_launcher_command(target.launcher, *STABLE_LAUNCHER_REPAIR_ARGS),
+                    ),
+                    reason="stable_launcher_running",
+                    launchers=[str(launcher) for launcher in moved],
+                )
+            # Report what the launchers select now, not what was attempted: the
+            # upgrade lock does not stop uv or another installer changing them.
+            remaining = stable_launcher_selections()
+            if len({selection.generation for selection in remaining}) > 1:
+                return _doctor_repair_result(
+                    target_name,
+                    "failed",
+                    i18n_t(
+                        "doctor.repair.stableLaunchersStillSplit",
+                        language,
+                        launchers=_describe_launcher_selections(remaining, language),
+                    ),
+                    reason="stable_launchers_still_split",
+                    launchers=[str(launcher) for launcher in moved],
+                )
+    except MigrationLockTimeout:
+        return _doctor_repair_result(
+            target_name,
+            "failed",
+            i18n_t("doctor.repair.stableLaunchersBusy", language),
+            reason="upgrade_lock_busy",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("stable launcher repair failed", exc_info=True)
+        return _doctor_repair_result(
+            target_name,
+            "failed",
+            i18n_t("doctor.repair.stableLaunchersFailed", language),
+            reason="stable_launcher_repair_exception",
+            error=str(exc),
+        )
+    return _doctor_repair_result(
+        target_name,
+        "repaired",
+        i18n_t(
+            "doctor.repair.stableLaunchersRepaired",
+            language,
+            launchers=", ".join(map(str, moved)),
+            version=target.version or i18n_t("doctor.value.unknown", language),
+            generation=target.generation,
+        ),
+        launchers=[str(launcher) for launcher in moved],
+        generation=str(target.generation),
+    )
+
+
 def _repair_stale_install_runtime(*, dry_run: bool = False) -> dict:
     target = "stale-install-runtime"
     language = _configured_cli_language()
@@ -13350,6 +13597,7 @@ def _repair_doctor_targets(targets: list[str], *, dry_run: bool = False, deep: b
     handlers = {
         "home-migration": _repair_home_migration,
         "stale-install-runtime": _repair_stale_install_runtime,
+        "stable-launchers": _repair_stable_launchers,
         "duplicate-service-processes": _repair_duplicate_service_processes,
         "stale-restart-state": _repair_stale_restart_state,
         "askill": _repair_askill,
@@ -16221,6 +16469,40 @@ def _schedule_delayed_restart(delay_seconds: float) -> int:
     return 0
 
 
+def _generation_downgrade_blocks(command: str | None, *, allow_downgrade: bool = False) -> bool:
+    """Report running an install older than the last activated one.
+
+    ``vibe start`` and ``vibe restart`` refuse unless the downgrade is explicit.
+    A supervisor-owned launch (``command`` is None, or the desktop shell) is
+    only warned: blocking it would leave the service down instead of old.
+    """
+
+    downgrade = generation_downgrade(current_generation())
+    if downgrade is None:
+        return False
+    supervised = command is None or is_desktop_managed_runtime()
+    if supervised:
+        key = "update.downgradeWarning"
+    else:
+        key = "update.downgradeAllowed" if allow_downgrade else "update.downgradeRefused"
+    print(
+        i18n_t(
+            key,
+            _configured_cli_language(),
+            command=command or "",
+            version=downgrade.version,
+            generation=downgrade.generation,
+            activatedVersion=downgrade.activated.version,
+            activatedGeneration=downgrade.activated.generation,
+            launcher=_launcher_command(downgrade.activated.launcher),
+            rerunCommand=_launcher_command(downgrade.activated.launcher, *([command] if command else [])),
+            repairCommand=_launcher_command(downgrade.activated.launcher, *STABLE_LAUNCHER_REPAIR_ARGS),
+        ),
+        file=sys.stderr,
+    )
+    return not supervised and not allow_downgrade
+
+
 def _cmd_restart_with_delay(delay_seconds: float) -> int:
     if delay_seconds > 0:
         return _schedule_delayed_restart(delay_seconds)
@@ -16249,6 +16531,11 @@ def build_parser():
         default=None,
         help="Start services without opening the Web UI in the system browser.",
     )
+    start_parser.add_argument(
+        "--allow-downgrade",
+        action="store_true",
+        help="Start this install even though a newer one was activated since.",
+    )
     desktop_parser = subparsers.add_parser("desktop", help=argparse.SUPPRESS)
     desktop_subparsers = desktop_parser.add_subparsers(dest="desktop_command", required=True)
     desktop_endpoint_parser = desktop_subparsers.add_parser("endpoint", help=argparse.SUPPRESS)
@@ -16259,6 +16546,11 @@ def build_parser():
         type=_non_negative_float,
         default=0,
         help="Schedule the restart to run asynchronously after N seconds, then exit immediately.",
+    )
+    restart_parser.add_argument(
+        "--allow-downgrade",
+        action="store_true",
+        help="Restart onto this install even though a newer one was activated since.",
     )
     # `__restart-supervisor` is deliberately absent here. It is never typed: this
     # program spawns it, and `vibe/restart_supervisor.py` owns both the argv it
@@ -18376,10 +18668,14 @@ def _dispatch_parsed_command(parser: argparse.ArgumentParser, args) -> None:
     if args.command == "stop":
         sys.exit(cmd_stop(receipt=args.receipt) if args.receipt is not None else cmd_stop())
     if args.command == "start":
+        if _generation_downgrade_blocks("start", allow_downgrade=args.allow_downgrade):
+            sys.exit(1)
         sys.exit(cmd_start(open_browser=args.open_browser))
     if args.command == "desktop" and args.desktop_command == "endpoint":
         sys.exit(cmd_desktop_endpoint())
     if args.command == "restart":
+        if _generation_downgrade_blocks("restart", allow_downgrade=args.allow_downgrade):
+            sys.exit(1)
         sys.exit(_cmd_restart_with_delay(args.delay_seconds))
     if args.command == "status":
         sys.exit(cmd_status())
@@ -18575,4 +18871,7 @@ def _dispatch_parsed_command(parser: argparse.ArgumentParser, args) -> None:
         if args.watch_command in {"remove", "rm"}:
             sys.exit(cmd_watch_remove(args.watch_id))
         parser.error("watch command is required")
+    # Bare `vibe` is also the supervisor entry (systemd, launchd); it is never
+    # refused, only told which newer install it is behind.
+    _generation_downgrade_blocks(None)
     sys.exit(cmd_vibe())

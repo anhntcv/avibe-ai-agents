@@ -727,6 +727,81 @@ def test_alias_invocation_cannot_retire_the_path_selected_command(
     assert subprocess.run([str(launcher)], check=False).returncode == 0
 
 
+@pytest.mark.parametrize("invoked", ["installer", "uv"])
+def test_root_launchers_move_together_through_either_activation(installation, monkeypatch, tmp_path, invoked):
+    """#2081: a root host has the installer's PATH launcher and uv's ~/.local/bin one."""
+    root, installer_launcher = installation
+    uv_launcher = tmp_path / "root-home" / ".local" / "bin" / "vibe"
+    foreign = tmp_path / "foreign-bin" / "vibe"
+    foreign_target = tmp_path / "foreign-target"
+    uv_launcher.parent.mkdir(parents=True)
+    foreign.parent.mkdir()
+    foreign_target.write_text("#!/bin/sh\nexit 0\n")
+    foreign_target.chmod(0o755)
+    foreign.symlink_to(foreign_target)
+    # The root shell's PATH does not include ~/.local/bin; only its fixed
+    # installer location makes it discoverable.
+    monkeypatch.setattr(upgrade, "INSTALLER_LAUNCHER_DIRS", (str(uv_launcher.parent), str(foreign.parent)))
+    old = activate(root, installer_launcher, "old")
+    uv_launcher.symlink_to(old)
+
+    current = activate(root, installer_launcher if invoked == "installer" else uv_launcher, "current")
+
+    assert installer_launcher.resolve() == current.resolve()
+    assert uv_launcher.resolve() == current.resolve()
+    assert {path.name for path in root.iterdir()} == {"current"}
+    assert os.readlink(foreign) == str(foreign_target)
+
+
+def test_a_launcher_that_cannot_move_keeps_its_generation(installation, monkeypatch, tmp_path):
+    root, launcher = installation
+    peer = tmp_path / "root-home" / ".local" / "bin" / "vibe"
+    peer.parent.mkdir(parents=True)
+    monkeypatch.setattr(upgrade, "INSTALLER_LAUNCHER_DIRS", (str(peer.parent),))
+    old = activate(root, launcher, "old")
+    peer.symlink_to(old)
+
+    def read_only(path, target):
+        raise PermissionError(f"{path} is read-only")
+
+    monkeypatch.setattr(upgrade, "_activate_launcher_target_locked", read_only)
+    current = activate(root, launcher, "current")
+
+    assert launcher.resolve() == current.resolve()
+    assert peer.resolve() == old.resolve()
+    assert {path.name for path in root.iterdir()} == {"old", "current"}
+    assert subprocess.run([str(peer)], check=False).returncode == 0
+
+
+def test_a_peer_replaced_after_discovery_is_left_alone(installation, monkeypatch, tmp_path):
+    """The upgrade lock serializes Avibe, not uv, another installer or an administrator."""
+    root, launcher = installation
+    peer = tmp_path / "root-home" / ".local" / "bin" / "vibe"
+    foreign_target = tmp_path / "foreign-target"
+    peer.parent.mkdir(parents=True)
+    foreign_target.write_text("#!/bin/sh\nexit 0\n")
+    foreign_target.chmod(0o755)
+    monkeypatch.setattr(upgrade, "INSTALLER_LAUNCHER_DIRS", (str(peer.parent),))
+    old = activate(root, launcher, "old")
+    peer.symlink_to(old)
+    discover = upgrade.managed_stable_launchers
+    replaced = []
+
+    def replaced_after_discovery(*launchers):
+        found = discover(*launchers)
+        if not replaced:
+            peer.unlink()
+            peer.symlink_to(foreign_target)
+            replaced.append(peer)
+        return found
+
+    monkeypatch.setattr(upgrade, "managed_stable_launchers", replaced_after_discovery)
+    current = activate(root, launcher, "current")
+
+    assert launcher.resolve() == current.resolve()
+    assert os.readlink(peer) == str(foreign_target)
+
+
 def test_partial_removal_retains_uv_evidence_and_next_pass_finishes(installation, monkeypatch):
     root, launcher = installation
     old = candidate(root, "old")

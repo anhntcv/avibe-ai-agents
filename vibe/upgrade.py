@@ -47,6 +47,10 @@ SHOW_RUNTIME_SKIP_ENV = "VIBE_INSTALL_SKIP_SHOW_RUNTIME"
 DESKTOP_MANAGED_RUNTIME_ENV = "AVIBE_DESKTOP_MANAGED_RUNTIME"
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 UV_FALLBACK_BIN_DIRS = (".local/bin", ".cargo/bin")
+# The fixed stable-launcher locations install.sh and install.ps1 choose from,
+# in addition to PATH and uv's configured tool bin. Discovery checks these
+# names; it never scans the filesystem.
+INSTALLER_LAUNCHER_DIRS = ("~/.local/bin", "~/bin", "/usr/local/bin", "/opt/homebrew/bin")
 UPGRADE_INSTALL_TIMEOUT_SECONDS = 30 * 60
 RESTART_PENDING_GRACE_SECONDS = 5 * 60
 DEFERRED_ACTIVATION_TIMEOUT_SECONDS = 5 * 60
@@ -495,6 +499,7 @@ def _launcher_generation(launcher: Path, root: Path) -> Path | None:
         return None
     # A marker is necessary only for the cross-volume copy fallback. Treat it
     # as a hint and prove that it still describes the live launcher before use.
+    # A managed launcher has its export's name (see ``managed_stable_launchers``).
     candidate = generation / "bin" / launcher.name
     try:
         # Read both files on every check. Marker validation is a safety
@@ -522,6 +527,247 @@ def _update_launcher_generation_marker(launcher: Path, target: Path, root: Path)
         with contextlib.suppress(OSError):
             replacement.unlink()
         logger.warning("failed to update launcher generation marker %s", marker, exc_info=True)
+
+
+@dataclass(frozen=True)
+class LauncherSelection:
+    """A stable launcher and the managed generation it currently selects."""
+
+    launcher: Path
+    generation: Path
+    version: str | None
+
+
+def generation_version(generation: Path) -> str | None:
+    """Return the Avibe version installed in one managed generation."""
+
+    from importlib import metadata
+
+    try:
+        site_packages = [
+            path
+            for layout in ("uv/tools", "tools")
+            for package in (PACKAGE_NAME, LEGACY_PACKAGE_NAME)
+            for path in (
+                *(generation / layout / package).glob("lib/python*/site-packages"),
+                generation / layout / package / "Lib" / "site-packages",
+            )
+            if path.is_dir()
+        ]
+        # The legacy distribution is a shim beside the core package once the
+        # rename shipped; the core package's version describes the code.
+        for package in (PACKAGE_NAME, LEGACY_PACKAGE_NAME):
+            for distribution in metadata.distributions(name=package, path=[str(path) for path in site_packages]):
+                if distribution.version:
+                    return distribution.version
+    except (OSError, ValueError):
+        # Unreadable or undecodable metadata is an unknown version, which never
+        # fences start and never stops status or doctor from reporting it.
+        pass
+    return None
+
+
+def _launcher_key(launcher: Path) -> str:
+    """Identify a launcher file by its canonical directory, not its own target."""
+
+    launcher = launcher.expanduser().absolute()
+    return os.path.normcase(str(launcher.parent.resolve() / launcher.name))
+
+
+def managed_stable_launchers(*launchers: str | os.PathLike[str] | None) -> list[tuple[Path, Path]]:
+    """Return every discoverable stable launcher with the managed generation it selects.
+
+    Candidates are the given launchers, the launcher this invocation ran
+    through, then every PATH entry, uv's configured tool bin and the
+    installers' fixed launcher locations. A launcher that
+    resolves outside this install's generation root, or to anything there that
+    retirement would not recognize as an Avibe installation, is not Avibe's to
+    manage and is never returned.
+    """
+
+    from vibe.install_generations import _uv_installation
+
+    root = atomic_uv_install_root().expanduser().resolve()
+    exported: dict[Path, frozenset[str]] = {}
+    names = ("vibe.exe",) if os.name == "nt" else ("vibe",)
+    directories = [*os.get_exec_path(), os.environ.get("UV_TOOL_BIN_DIR", ""), *INSTALLER_LAUNCHER_DIRS]
+    # An activation through an off-PATH launcher moves that launcher, so later
+    # discovery must still see it beside any peer that could not move.
+    invoked = get_running_vibe_path()
+    candidates = [Path(launcher) for launcher in (*launchers, invoked) if launcher]
+    candidates.extend(Path(directory) / name for directory in directories if directory for name in names)
+    seen: set[str] = set()
+    result: list[tuple[Path, Path]] = []
+    for candidate in candidates:
+        launcher = candidate.expanduser()
+        if not launcher.is_absolute() or not _is_stable_launcher_path(launcher):
+            continue
+        try:
+            key = _launcher_key(launcher)
+            present = launcher.is_symlink() or launcher.exists()
+        except (OSError, RuntimeError):
+            continue
+        if not present or key in seen:
+            continue
+        seen.add(key)
+        generation = _launcher_generation(launcher, root)
+        if generation is None:
+            continue
+        if generation not in exported:
+            try:
+                installation = _uv_installation(generation)
+            except OSError:
+                installation = None
+            exported[generation] = frozenset(
+                os.path.normcase(export.name) for export in (installation[1] if installation else ())
+            )
+        # Invariant: a managed launcher has the name of a launcher its install
+        # exports, so ``generation/bin/<launcher name>`` is that export. The
+        # copy-marker check and every move rely on it; any other name, such as
+        # an extensionless alias of Windows' ``vibe.exe``, is not Avibe's.
+        if os.path.normcase(launcher.name) in exported[generation]:
+            result.append((launcher.absolute(), generation))
+    return result
+
+
+def stable_launcher_selections(*launchers: str | os.PathLike[str] | None) -> list[LauncherSelection]:
+    """Describe every managed stable launcher with its generation's version."""
+
+    versions: dict[Path, str | None] = {}
+    selections: list[LauncherSelection] = []
+    for launcher, generation in managed_stable_launchers(*launchers):
+        if generation not in versions:
+            versions[generation] = generation_version(generation)
+        selections.append(LauncherSelection(launcher, generation, versions[generation]))
+    return selections
+
+
+def _generation_installed_at(generation: Path) -> float:
+    """When uv installed a generation, from the receipt it writes for each install."""
+
+    times = []
+    for receipt in (*generation.glob("uv/tools/*/uv-receipt.toml"), *generation.glob("tools/*/uv-receipt.toml")):
+        with contextlib.suppress(OSError):
+            times.append(receipt.stat().st_mtime)
+    return max(times, default=float("-inf"))
+
+
+def _activation_rank(generation: Path, version: str | None) -> tuple:
+    """Order installs so the last activated one ranks highest.
+
+    The newest version wins, and a known version outranks an unknown one.
+    Generations of the same version, such as a reinstall or integrity repair,
+    rank by when uv installed them: activation always installs a fresh
+    generation, so the most recent install of a version is the one activated.
+    This is the only ordering behind both the repair target and the fence.
+    """
+
+    parsed = _parse_version(version) if version else None
+    installed_at = _generation_installed_at(generation)
+    return (0, installed_at) if parsed is None else (1, parsed, installed_at)
+
+
+def top_ranked_selections(selections: list[LauncherSelection]) -> list[LauncherSelection]:
+    """Return every launcher selecting an install at the highest ``_activation_rank``.
+
+    More than one generation here is a tie: the evidence cannot say which
+    install was activated last.
+    """
+
+    ranks: dict[Path, tuple] = {}
+    for selection in selections:
+        if selection.generation not in ranks:
+            ranks[selection.generation] = _activation_rank(selection.generation, selection.version)
+    if not ranks:
+        return []
+    top = max(ranks.values())
+    return [selection for selection in selections if ranks[selection.generation] == top]
+
+
+def newest_launcher_selection(selections: list[LauncherSelection]) -> LauncherSelection | None:
+    """Return a launcher selecting the last activated install, or ``None`` when that is unknown.
+
+    A tie between different generations is ambiguous, never settled by
+    discovery order: the repair then has no target, and the fence and the
+    service warning have no last activation to compare against.
+    """
+
+    top = top_ranked_selections(selections)
+    return top[0] if len({selection.generation for selection in top}) == 1 else None
+
+
+def current_generation() -> Path | None:
+    """Return the managed generation this process runs from, if any."""
+
+    root = atomic_uv_install_root()
+    for path in (sys.executable, sys.prefix, __file__):
+        generation = _generation_for_path(Path(path).absolute(), root)
+        if generation is not None:
+            return generation
+    return None
+
+
+def process_generation(pid: int | None) -> Path | None:
+    """Return the managed generation another process runs from, if it can be read."""
+
+    import psutil
+
+    if not pid:
+        return None
+    try:
+        process = psutil.Process(pid)
+        values = [argument.strip('"') for argument in process.cmdline()]
+        values.append(process.exe())
+    except (psutil.Error, OSError):
+        return None
+    root = atomic_uv_install_root()
+    for value in values:
+        if value and Path(value).is_absolute():
+            generation = _generation_for_path(Path(value), root)
+            if generation is not None:
+                return generation
+    return None
+
+
+@dataclass(frozen=True)
+class GenerationDowngrade:
+    """A generation older than the newest one a stable launcher selects."""
+
+    generation: Path
+    version: str
+    activated: LauncherSelection
+
+    def as_dict(self) -> dict[str, str | None]:
+        return {
+            "generation": str(self.generation),
+            "version": self.version,
+            "activated_generation": str(self.activated.generation),
+            "activated_version": self.activated.version,
+            "launcher": str(self.activated.launcher),
+        }
+
+
+def generation_downgrade(generation: Path | None) -> GenerationDowngrade | None:
+    """Report whether a generation is older than the last activated one.
+
+    Activation keeps every stable launcher on the generation it installs, so
+    the highest ``_activation_rank`` any launcher selects is the last
+    activation; an older install of the same version counts as well. A
+    generation whose own version is unknown never counts as a downgrade, and
+    neither does anything while the top rank is tied between installs.
+    """
+
+    if generation is None:
+        return None
+    version = generation_version(generation)
+    if version is None or _parse_version(version) is None:
+        return None
+    newest = newest_launcher_selection(stable_launcher_selections())
+    if newest is None or newest.generation == generation:
+        return None
+    if _activation_rank(newest.generation, newest.version) <= _activation_rank(generation, version):
+        return None
+    return GenerationDowngrade(generation, version, newest)
 
 
 def atomic_activation_source_is_current(activation: AtomicActivation) -> bool:
@@ -625,6 +871,12 @@ def _activate_upgrade_candidate_locked(activation: AtomicActivation) -> None:
     if not result.ok:
         raise RuntimeError(f"staged Avibe install failed integrity checks: {result.detail}")
     launcher = activation.launcher
+    # Every other stable launcher already selecting a managed generation moves
+    # with the invoked one, so no PATH lookup keeps an older build. Discover
+    # them before the commit: once the primary launcher is replaced, nothing
+    # here may raise and make the caller discard the activated candidate.
+    primary = _launcher_key(launcher)
+    peers = [(peer, selected) for peer, selected in managed_stable_launchers() if _launcher_key(peer) != primary]
     launcher.parent.mkdir(parents=True, exist_ok=True)
     replacement = launcher.parent / f".{launcher.name}.avibe-{uuid4().hex}.new"
     root = atomic_uv_install_root().expanduser().resolve()
@@ -636,6 +888,16 @@ def _activate_upgrade_candidate_locked(activation: AtomicActivation) -> None:
             replacement.unlink()
         raise
     _update_launcher_generation_marker(launcher, activation.candidate_launcher, root)
+    # A peer left behind stays protected from collection and is reported by
+    # `vibe doctor`; it must not undo the committed activation. A peer that
+    # now follows the primary, such as an alias of it, keeps its shape.
+    activated = _generation_for_path(activation.candidate_launcher, root)
+    for peer, selected in peers:
+        try:
+            if selected != activated:
+                move_managed_launcher_locked(peer, selected, activation.candidate_launcher)
+        except Exception:
+            logger.warning("Could not move stable launcher %s to the activated generation", peer, exc_info=True)
     finish_install_generation(activation.candidate_launcher)
     collect_install_generations(launcher)
 
@@ -657,6 +919,20 @@ def activate_launcher_target(launcher: str | os.PathLike[str], target: str | os.
 
     with atomic_upgrade_lock():
         _activate_launcher_target_locked(launcher, target)
+
+
+def move_managed_launcher_locked(launcher: Path, selected: Path, target: str | os.PathLike[str]) -> bool:
+    """Repoint a stable launcher only while it still selects the generation it was found on.
+
+    The upgrade lock serializes Avibe, not uv, other installers or an
+    administrator. A launcher replaced since discovery is no longer Avibe's to
+    move, so it is left as it is and reported as not moved.
+    """
+
+    if _launcher_generation(launcher, atomic_uv_install_root().expanduser().resolve()) != selected:
+        return False
+    _activate_launcher_target_locked(launcher, target)
+    return True
 
 
 def _activate_launcher_target_locked(launcher: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
