@@ -64,8 +64,8 @@ and fall back to GitHub.
 - `sha256` is GitHub's asset digest, re-verified against the downloaded bytes
   before upload. `commit` is the peeled tag target.
 - Producer: the release mirror workflow. Consumers: the desktop updater.
-  Planned: the CLI update checker and the runtime downloaders, replacing their
-  `api.github.com` discovery calls.
+  Planned: the CLI update checker, replacing its `api.github.com` discovery
+  call. Runtime downloads use pinned release URLs and need no index.
 - The index is unauthenticated metadata. A hostile index can at most withhold
   releases or name copies that then fail the consumer's existing verification.
 
@@ -116,6 +116,29 @@ Cloudflare configuration lives outside the repository. The expected state:
   and browser TTL respect the origin. The object headers above carry the
   policy; the rule exists because default caching skips extensions such as
   `.whl`, `.tgz`, `.json`, and `.sig`.
+- The zone's Browser Integrity Check answers the `Python-urllib` User-Agent
+  with 403 (error 1010). Clients name their own agent; curl, PowerShell, and
+  Rust clients already pass.
+
+## Client downloads
+
+The managed git runtime, the model hub engine, and Show Runtime manifest
+archives download through `core.dependency_network.fetch_to_path`:
+
+- An Avibe release URL without a query tries the mirror, then GitHub. Any other
+  URL (tmux builds, legacy Show Runtime archives, manifest overrides) keeps its
+  single source.
+- Sources rotate, each with the download retry budget. A non-retryable failure,
+  such as a mirror 404, drops that source.
+- A failed or stalled attempt (the caller's socket timeout) keeps its bytes, and
+  the next attempt asks for the rest with `Range`. A `200` restarts the file; a
+  `206` must start at the current length. A body shorter than its
+  `Content-Length` is incomplete, not finished.
+- The source that last completed a download goes first for the rest of the
+  process.
+- The pinned `sha256` check after download is unchanged.
+
+`probe_url` reports a release asset reachable when any of its sources answers.
 
 ## Rollout
 
@@ -123,10 +146,11 @@ Cloudflare configuration lives outside the repository. The expected state:
 2. Cache Rule, then real-file tests from the three mainland carriers at the
    evening peak.
 3. Clients, one at a time: desktop updater (done), then runtime and Show
-   Runtime downloads, then `install.sh` and `install.ps1`. Each tries the mirror
-   first, then GitHub, with a connect timeout and a stall watchdog, resumes with
-   `Range` when switching source, and remembers the last source that worked.
-   The desktop shell's `avibe_runtime_host::download` is the Rust reference.
+   Runtime downloads (done), then `install.sh` and `install.ps1`. Each tries the
+   mirror first, then GitHub, with a connect timeout and a stall watchdog,
+   resumes with `Range` when switching source, and remembers the last source
+   that worked. The references are the desktop shell's
+   `avibe_runtime_host::download` (Rust) and Client downloads above (Python).
 4. Install-script third-party dependencies (the uv installer and
    python-build-standalone) through `UV_INSTALLER_GITHUB_BASE_URL` and
    `UV_PYTHON_INSTALL_MIRROR`, if step 2 shows GitHub is still their
