@@ -679,7 +679,15 @@ class AgentAuthService:
         # binary``. Without these fallbacks, setup / logout / test
         # flows ignore a non-default cli_path and fall through to
         # ``$PATH``, breaking installs that pin a specific binary.
-        backend_cfg = self._resolve_backend_config(backend)
+        config = getattr(getattr(self, "controller", None), "config", None)
+        # Live IM controllers hand ``AppCompatConfig``, whose top-level
+        # selector is already the runtime projection. Anything read from the
+        # V2 ``agents`` shape (the Web stub controller, or a reload below) is a
+        # raw persisted selector and is projected the same way before use.
+        backend_cfg = getattr(config, backend, None) if config is not None else None
+        runtime_projected = backend_cfg is not None
+        if backend_cfg is None:
+            backend_cfg = self._resolve_backend_config(backend)
         # Compatibility projection can erase recovery provenance, so inventory
         # validates persisted evidence even when a live backend object exists.
         if strict or backend_cfg is None:
@@ -706,7 +714,18 @@ class AgentAuthService:
                     exc_info=True,
                 )
         cli_path = getattr(backend_cfg, "cli_path", None) or getattr(backend_cfg, "binary", None)
-        return cli_path or backend
+        if runtime_projected:
+            return cli_path or backend
+        from config.v2_compat import runtime_agent_cli_path
+
+        if backend == "claude":
+            # Normalize the raw V2 selector before desktop resolution. A
+            # copied ``"  claude  "`` must resolve as the default executable,
+            # rather than as a literal filename that the resolver cannot find.
+            from vibe.claude_config import normalize_claude_cli_path
+
+            cli_path = normalize_claude_cli_path(cli_path)
+        return runtime_agent_cli_path(cli_path, backend, resolve_agent_paths=True)
 
     def _resolve_backend_probe_cwd(self, backend: str, *, prepare: bool = False) -> str:
         """Resolve the configured runtime cwd without mutating it by default."""
@@ -1559,6 +1578,7 @@ class AgentAuthService:
             CLAUDE_MEMORY_DISABLED_SETTINGS,
             CLAUDE_SETTING_SOURCES,
             build_claude_subprocess_env,
+            normalize_claude_cli_path,
         )
 
         # ``force_oauth=True`` because this code path IS the OAuth
@@ -1591,6 +1611,12 @@ class AgentAuthService:
 
         get_cli_override = getattr(session_handler, "_get_claude_cli_path_override", None)
         cli_override = get_cli_override() if callable(get_cli_override) else None
+        if not cli_override:
+            # Web-initiated flows use the web controller stub, which has no
+            # session handler. Fall back to the configured backend binary so
+            # OAuth uses the same Claude Code version as normal Agent turns
+            # instead of silently selecting the SDK's bundled CLI.
+            cli_override = normalize_claude_cli_path(self._get_cli_binary("claude"))
         if cli_override:
             option_kwargs["cli_path"] = cli_override
 

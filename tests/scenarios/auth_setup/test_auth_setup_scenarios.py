@@ -961,6 +961,100 @@ def test_remote_web_oauth_cold_launch_retry_is_single_owner(monkeypatch, tmp_pat
     )
 
 
+@pytest.mark.parametrize(
+    "selector_case",
+    ["padded_path", "desktop_default", "desktop_padded_default"],
+)
+def test_web_claude_oauth_launches_the_persisted_cli_path(monkeypatch, tmp_path, selector_case):
+    """Scenario: AUTH-SETUP-911"""
+    import core.agent_auth_service as auth_module
+    from vibe import api as vibe_api
+
+    claude_home = tmp_path / "claude-home"
+    claude_home.mkdir()
+    if selector_case == "padded_path":
+        # A path pasted into Settings keeps its surrounding whitespace on disk.
+        configured_cli = tmp_path / "bin" / "claude-new"
+        persisted_selector = f"  {configured_cli}  "
+    else:
+        # A GUI-launched desktop Runtime has no shell PATH; normal Agent turns
+        # resolve the default selector to the user's installed executable.
+        configured_cli = tmp_path / ".local" / "bin" / "claude"
+        configured_cli.parent.mkdir(parents=True)
+        configured_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        configured_cli.chmod(0o755)
+        persisted_selector = "  claude  " if selector_case == "desktop_padded_default" else "claude"
+        monkeypatch.setenv("AVIBE_DESKTOP_MANAGED_RUNTIME", "1")
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr("vibe.cli_paths.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.setattr(auth_module, "CLAUDE_SDK_AVAILABLE", True)
+
+    harness = SimpleNamespace(launches=[], control_requests=[], disconnects=0)
+
+    class FakeClaudeSDKClient:
+        def __init__(self, *, options):
+            harness.launches.append(options)
+            self._query = SimpleNamespace(_send_control_request=self._send_control_request)
+
+        async def connect(self):
+            return None
+
+        async def _send_control_request(self, request, *, timeout):
+            harness.control_requests.append(request["subtype"])
+            if request["subtype"] == "claude_authenticate":
+                return {"manualUrl": "https://claude.invalid/authorize"}
+            # The login stays pending until the user cancels it.
+            await asyncio.Event().wait()
+
+        async def disconnect(self):
+            harness.disconnects += 1
+
+    # The Web surface builds its own service over the stub controller, which
+    # re-reads persisted config and has no IM session handler.
+    service = AgentAuthService(vibe_api._WebControllerStub())
+    monkeypatch.setattr(vibe_api, "_get_oauth_service", lambda: service)
+    monkeypatch.setattr(auth_module, "ClaudeSDKClient", FakeClaudeSDKClient)
+    runner = ScenarioRunner(harness)
+
+    def save_cli_selector(current):
+        config = V2Config(
+            mode="self_host",
+            version="v2",
+            slack=SlackConfig(bot_token=""),
+            runtime=RuntimeConfig(default_cwd=str(tmp_path)),
+            agents=AgentsConfig(),
+        )
+        config.agents.claude.cli_path = persisted_selector
+        save_direct_auth_config(config)
+
+    async def start_web_oauth(current):
+        current.start = await vibe_api.start_oauth_web_async("claude", force_reset=False)
+
+    async def cancel_web_oauth(current):
+        current.cancel = await vibe_api.cancel_oauth_web_async(current.start["flow_id"])
+
+    asyncio.run(
+        runner.run(
+            ScenarioStep("save_cli_selector", save_cli_selector),
+            ScenarioStep("start_web_oauth", start_web_oauth),
+            ScenarioStep("cancel_web_oauth", cancel_web_oauth),
+        )
+    )
+
+    assert harness.start["ok"] is True
+    assert harness.start["state"] == "awaiting_code"
+    assert harness.start["url"] == "https://claude.invalid/authorize"
+    assert [options.cli_path for options in harness.launches] == [str(configured_cli)]
+    assert harness.control_requests[0] == "claude_authenticate"
+    assert harness.cancel["ok"] is True
+    assert harness.disconnects == 1
+    ScenarioExpect.step_history(
+        runner,
+        ["save_cli_selector", "start_web_oauth", "cancel_web_oauth"],
+    )
+
+
 def _save_remote_session_authorization_config(instance_kind: str) -> V2Config:
     config = _save_remote_web_auth_config()
     cloud = config.remote_access.vibe_cloud

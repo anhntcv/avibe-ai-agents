@@ -14,6 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import core.agent_auth_service as agent_auth_service_module
 import core.handlers.session_handler as session_handler_module
 from config.v2_compat import to_app_config
 from config.v2_config import (
@@ -27,6 +28,7 @@ from config.v2_config import (
 )
 from config.v2_settings import RoutingSettings
 from core import git_runtime as git_runtime_module
+from core.agent_auth_service import AgentAuthService
 from core.handlers.session_handler import SessionHandler
 from core.runtime_activation import RuntimeActivationRegistry
 from core.runtime_ownership import RuntimeTargetOwnershipSnapshot, SessionRuntimeDisposition
@@ -164,6 +166,60 @@ def test_to_app_config_preserves_claude_cli_path() -> None:
     assert compat.claude.cli_path == "/usr/local/bin/claude-proxy"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured_cli", "expected_cli"),
+    [
+        ("/usr/local/bin/claude-new", "/usr/local/bin/claude-new"),
+        ("  /usr/local/bin/claude-new  ", "/usr/local/bin/claude-new"),
+        ("  claude  ", None),
+    ],
+)
+async def test_web_auth_uses_configured_claude_cli_path_without_session_handler(
+    monkeypatch,
+    configured_cli: str,
+    expected_cli: str | None,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _StubClaudeSDKClient:
+        def __init__(self, options):
+            captured["options"] = options
+
+        async def connect(self) -> None:
+            captured["connected"] = True
+
+    class _Governor:
+        @staticmethod
+        def apply_to_pid(_pid, label="agent"):
+            captured["governor_label"] = label
+
+    monkeypatch.setattr(agent_auth_service_module, "ClaudeAgentOptions", _StubClaudeAgentOptions)
+    monkeypatch.setattr(agent_auth_service_module, "ClaudeSDKClient", _StubClaudeSDKClient)
+    monkeypatch.setattr(agent_auth_service_module, "get_claude_client_pid", lambda _client: None)
+    monkeypatch.setattr(agent_auth_service_module, "governor_from_controller", lambda _controller: _Governor())
+
+    controller = SimpleNamespace(
+        config=SimpleNamespace(
+            agents=SimpleNamespace(
+                claude=SimpleNamespace(
+                    cli_path=configured_cli,
+                    auth_mode="oauth",
+                    api_key=None,
+                    base_url=None,
+                )
+            )
+        )
+    )
+    service = object.__new__(AgentAuthService)
+    service.controller = controller
+
+    await service._create_claude_control_client()
+
+    assert captured["connected"] is True
+    assert captured["options"].cli_path == expected_cli
+
+
 def test_to_app_config_resolves_all_desktop_backend_executables(monkeypatch, tmp_path: Path) -> None:
     binaries = {
         "claude": tmp_path / ".local" / "bin" / "claude",
@@ -184,7 +240,7 @@ def test_to_app_config_resolves_all_desktop_backend_executables(monkeypatch, tmp
         slack=SlackConfig(),
         runtime=RuntimeConfig(default_cwd="/tmp/workdir"),
         agents=AgentsConfig(
-            claude=ClaudeConfig(cli_path="claude"),
+            claude=ClaudeConfig(cli_path="  claude  "),
             codex=CodexConfig(cli_path="codex"),
             opencode=OpenCodeConfig(cli_path="opencode"),
         ),
@@ -197,6 +253,31 @@ def test_to_app_config_resolves_all_desktop_backend_executables(monkeypatch, tmp
     assert compat.codex.binary == str(binaries["codex"])
     assert compat.opencode is not None
     assert compat.opencode.binary == str(binaries["opencode"])
+
+
+def test_auth_service_projects_only_raw_backend_selectors(monkeypatch, tmp_path: Path) -> None:
+    installed = tmp_path / ".local" / "bin" / "claude"
+    installed.parent.mkdir(parents=True)
+    installed.write_text("#!/bin/sh\n", encoding="utf-8")
+    installed.chmod(0o755)
+    monkeypatch.setenv("AVIBE_DESKTOP_MANAGED_RUNTIME", "1")
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr("vibe.cli_paths.Path.home", lambda: tmp_path)
+
+    web_service = object.__new__(AgentAuthService)
+    web_service.controller = SimpleNamespace(
+        config=SimpleNamespace(agents=SimpleNamespace(claude=SimpleNamespace(cli_path="claude")))
+    )
+    live_service = object.__new__(AgentAuthService)
+    live_service.controller = SimpleNamespace(config=SimpleNamespace(claude=SimpleNamespace(cli_path="claude")))
+
+    # The Web stub reads raw V2 selectors and projects them like to_app_config.
+    assert web_service._get_cli_binary("claude") == str(installed)
+    # A live controller's AppCompatConfig is already projected; keep it as-is.
+    assert live_service._get_cli_binary("claude") == "claude"
+
+    web_service.controller.config.agents.claude.cli_path = "  claude  "
+    assert web_service._get_cli_binary("claude") == str(installed)
 
 
 def test_to_app_config_keeps_missing_private_backend_selectors_off_path(monkeypatch, tmp_path: Path) -> None:
