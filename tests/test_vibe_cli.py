@@ -1082,9 +1082,9 @@ def test_cmd_stop_ignores_absent_services(monkeypatch):
     status = []
 
     monkeypatch.setattr(cli, "_pid_file_points_to_live_process", lambda path: False)
-    monkeypatch.setattr(runtime, "stop_service", lambda: False)
-    monkeypatch.setattr(runtime, "stop_ui", lambda: False)
-    monkeypatch.setattr(cli, "_stop_opencode_server", lambda: False)
+    monkeypatch.setattr(runtime, "stop_service", lambda **kwargs: False)
+    monkeypatch.setattr(runtime, "stop_ui", lambda **kwargs: False)
+    monkeypatch.setattr(cli, "_stop_opencode_server", lambda *args: False)
     monkeypatch.setattr(cli, "_write_status", lambda state, detail=None: status.append((state, detail)))
 
     assert cli.cmd_stop() == 0
@@ -1096,9 +1096,9 @@ def test_cmd_stop_fails_when_live_service_survives(monkeypatch, capsys):
     service_pid = paths.get_runtime_pid_path()
 
     monkeypatch.setattr(cli, "_pid_file_points_to_live_process", lambda path: path == service_pid)
-    monkeypatch.setattr(runtime, "stop_service", lambda: False)
-    monkeypatch.setattr(runtime, "stop_ui", lambda: False)
-    monkeypatch.setattr(cli, "_stop_opencode_server", lambda: False)
+    monkeypatch.setattr(runtime, "stop_service", lambda **kwargs: False)
+    monkeypatch.setattr(runtime, "stop_ui", lambda **kwargs: False)
+    monkeypatch.setattr(cli, "_stop_opencode_server", lambda *args: False)
     monkeypatch.setattr(cli, "_write_status", lambda state, detail=None: status.append((state, detail)))
 
     assert cli.cmd_stop() == 2
@@ -1111,9 +1111,9 @@ def test_cmd_stop_fails_when_lock_owner_survives_without_pidfile(monkeypatch, ca
 
     monkeypatch.setattr(cli.runtime, "resolve_service_owner_pid", lambda include_starting=False: 1234)
     monkeypatch.setattr(cli.runtime, "ui_pid_file_points_to_running_ui", lambda: False)
-    monkeypatch.setattr(runtime, "stop_service", lambda: False)
-    monkeypatch.setattr(runtime, "stop_ui", lambda: False)
-    monkeypatch.setattr(cli, "_stop_opencode_server", lambda: False)
+    monkeypatch.setattr(runtime, "stop_service", lambda **kwargs: False)
+    monkeypatch.setattr(runtime, "stop_ui", lambda **kwargs: False)
+    monkeypatch.setattr(cli, "_stop_opencode_server", lambda *args: False)
     monkeypatch.setattr(cli, "_write_status", lambda state, detail=None: status.append((state, detail)))
 
     assert cli.cmd_stop() == 2
@@ -1310,7 +1310,7 @@ def start_runtime(monkeypatch):
     # someone else's live process: the real stop_ui() would signal pid 5678.
     # Record both calls instead of making them.
     monkeypatch.setattr(runtime, "stop_ui", lambda **kwargs: stopped.append("stop_ui") or True)
-    monkeypatch.setattr(runtime, "stop_service", lambda: stopped.append("stop_service") or True)
+    monkeypatch.setattr(runtime, "stop_service", lambda **kwargs: stopped.append("stop_service") or True)
     return SimpleNamespace(
         service_path=service_path, ui_path=ui_path, spawned=spawned, opened=opened, stopped=stopped,
     )
@@ -1417,7 +1417,7 @@ def test_cmd_start_ensures_services_without_stopping(monkeypatch):
     assert not any(call == "stop" for call in calls)
 
 
-def _superseded_controller(monkeypatch, result, *, ui_running=False):
+def _superseded_controller(monkeypatch, result):
     calls = []
     monkeypatch.setenv("AVIBE_DESKTOP_RUNTIME_ID", "b" * 64)
     monkeypatch.setattr(
@@ -1430,7 +1430,6 @@ def _superseded_controller(monkeypatch, result, *, ui_running=False):
         "stop_desktop_runtime",
         lambda runtime_id, **kwargs: calls.append((runtime_id, kwargs)) or result,
     )
-    monkeypatch.setattr(cli.runtime, "ui_pid_file_points_to_running_ui", lambda: ui_running)
     return calls
 
 
@@ -1461,19 +1460,17 @@ def _left(role):
 
 
 @pytest.mark.parametrize(
-    ("result", "ui_running", "status"),
+    ("result", "status"),
     [
-        (cli.runtime.DesktopRuntimeStopResult(refusal="service_runtime_id_mismatch"), False, 3),
-        (cli.runtime.DesktopRuntimeStopResult(remaining=_left("service")), False, 2),
-        (cli.runtime.DesktopRuntimeStopResult(remaining=_left("installer")), False, 2),
-        (cli.runtime.DesktopRuntimeStopResult(remaining=_left("opencode")), False, 2),
-        (cli.runtime.DesktopRuntimeStopResult(remaining=_left("unknown")), False, 2),
-        # Stopped, but a UI of some other Runtime still holds the pidfile.
-        (cli.runtime.DesktopRuntimeStopResult(), True, 3),
+        (cli.runtime.DesktopRuntimeStopResult(refusal="service_runtime_id_mismatch"), 3),
+        (cli.runtime.DesktopRuntimeStopResult(remaining=_left("service")), 2),
+        (cli.runtime.DesktopRuntimeStopResult(remaining=_left("installer")), 2),
+        (cli.runtime.DesktopRuntimeStopResult(remaining=_left("opencode")), 2),
+        (cli.runtime.DesktopRuntimeStopResult(remaining=_left("unknown")), 2),
     ],
 )
-def test_desktop_start_fails_when_the_superseded_controller_is_not_stopped(monkeypatch, result, ui_running, status):
-    _superseded_controller(monkeypatch, result, ui_running=ui_running)
+def test_desktop_start_fails_when_the_superseded_controller_is_not_stopped(monkeypatch, result, status):
+    _superseded_controller(monkeypatch, result)
 
     # 3: this start does not take the home over; 2: part of it may still run.
     assert cli._handover_superseded_desktop_runtime(allowed=True) == status
@@ -1765,7 +1762,7 @@ def _ui_refuses_to_start(
             raise ui_outcome
         return _fake_start_result(ui_outcome, kwargs, reused=ui_reused) if ui_outcome else None
 
-    def stop_service():
+    def stop_service(**kwargs):
         calls.append("stop_service")
         return True
 
