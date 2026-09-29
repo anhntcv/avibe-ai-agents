@@ -13852,6 +13852,23 @@ def cmd_desktop_endpoint() -> int:
     return 0
 
 
+def cmd_desktop_remove_backends() -> int:
+    """Delete the desktop's backend installs: 3 while an install holds them, 2 when part may remain."""
+
+    from vibe.desktop_backends import DesktopBackendError, remove_desktop_backends
+
+    try:
+        remove_desktop_backends()
+    except DesktopBackendError as exc:
+        logger.error("Desktop backend removal failed: %s", exc)
+        if exc.code == "install_locked":
+            _print_stop_json({"reason": exc.code})
+            return 3
+        _print_stop_json({"failed": exc.code})
+        return 2
+    return 0
+
+
 def cmd_vibe():
     """Compatibility default: bare `vibe` starts services and opens the Web UI."""
     return cmd_start()
@@ -13937,6 +13954,7 @@ _STOP_FAILURES = {
     "installer": ("runtime.stop.installerFailed", "desktop backend install drain failed"),
     "opencode": ("runtime.stop.opencodeFailed", "opencode stop failed"),
     "unknown": ("runtime.stop.unknownFailed", "unidentified runtime process left running"),
+    "remote_access": ("runtime.stop.remoteAccessFailed", "remote access stop failed"),
 }
 
 
@@ -13962,30 +13980,66 @@ def _print_stop_json(payload: dict) -> None:
     print(json.dumps(payload, separators=(",", ":")), file=sys.stderr)
 
 
-def _stop_expected_desktop_runtime(runtime_id: str) -> int:
+def _print_left_running(result: runtime.DesktopRuntimeStopResult) -> None:
+    # A tunnel connector started by a desktop UI inherits its Runtime id, so
+    # the scan may list it; what is reported is what still runs on return.
+    left_running = [item for item in result.left_running if runtime.pid_alive(item.pid)]
+    if left_running:
+        _print_stop_json({"left_running": [{"pid": item.pid, "name": item.name} for item in left_running]})
+
+
+def _stop_expected_desktop_runtime(runtime_id: str, *, keep_remote_access: bool = False) -> int:
     result = runtime.stop_desktop_runtime(runtime_id)
     if result.outcome is runtime.DesktopRuntimeStopOutcome.NOT_OURS:
         _print_stop_json({"reason": result.refusal})
         return 3
-    if result.left_running:
-        _print_stop_json({"left_running": [{"pid": item.pid, "name": item.name} for item in result.left_running]})
     if result.opencode_stopped:
         _report_opencode_stopped()
     # Unlike a full stop, an OpenCode server of this Runtime that survives
     # fails this stop: the desktop host replaces or removes the bundle it runs from.
     if result.outcome is runtime.DesktopRuntimeStopOutcome.FAILED:
+        _print_left_running(result)
         status = _stop_failed(result.failure, _write_status_unless_a_service_holds_the_lock)
         remaining = [{"pid": item.pid, "role": item.role} for item in result.remaining]
         _print_stop_json({"failed": result.failure, "remaining": remaining})
         return status
+    if keep_remote_access:
+        _write_status_unless_a_service_holds_the_lock("stopped")
+        status = 0
+    else:
+        status = _stop_the_home_s_connector()
+    _print_left_running(result)
+    if status:
+        _print_stop_json({"failed": "remote_access", "remaining": []})
+    return status
 
-    _write_status_unless_a_service_holds_the_lock("stopped")
-    return 0
+
+def _stop_the_home_s_connector() -> int:
+    # The tunnel connector serves this home's Web UI, whichever Runtime
+    # started it. It stops only while this stop holds the free service lock,
+    # so no service can run, and no UI of this home is left to serve it.
+    outcome: list[int] = []
+
+    def settle_the_connector() -> None:
+        if runtime.ui_pid_file_points_to_running_ui() or runtime.stop_remote_access_connector():
+            _write_status("stopped")
+            outcome.append(0)
+        else:
+            outcome.append(_stop_failed("remote_access"))
+
+    presence = runtime.desktop_service_lock_presence(while_absent=settle_the_connector)
+    # The service holding the lock still owns the connector, and the status.
+    if presence is runtime.DesktopRuntimePresence.MISMATCH or outcome == [0]:
+        return 0
+    if not outcome:
+        # No free lock showed that no service still needs the connector.
+        outcome.append(_stop_failed("remote_access", _write_status_unless_a_service_holds_the_lock))
+    return outcome[0]
 
 
-def cmd_stop(*, receipt: str | None = None, expect_runtime_id: str | None = None):
+def cmd_stop(*, receipt: str | None = None, expect_runtime_id: str | None = None, keep_remote_access: bool = False):
     if expect_runtime_id is not None:
-        return _stop_expected_desktop_runtime(expect_runtime_id)
+        return _stop_expected_desktop_runtime(expect_runtime_id, keep_remote_access=keep_remote_access)
     if receipt is not None:
         reason = _stop_receipt_refusal(receipt)
         if reason is not None:
@@ -16595,6 +16649,11 @@ def build_parser():
         metavar="RUNTIME_ID",
         help="Stop only the processes the desktop Runtime with this id started.",
     )
+    stop_parser.add_argument(
+        "--keep-remote-access",
+        action="store_true",
+        help="With --expect-runtime-id, leave the remote access tunnel running.",
+    )
     start_parser = subparsers.add_parser("start", help="Start services if needed without stopping running processes")
     start_parser.add_argument(
         "--no-open-browser",
@@ -16612,6 +16671,7 @@ def build_parser():
     desktop_subparsers = desktop_parser.add_subparsers(dest="desktop_command", required=True)
     desktop_endpoint_parser = desktop_subparsers.add_parser("endpoint", help=argparse.SUPPRESS)
     desktop_endpoint_parser.add_argument("--json", action="store_true", required=True, help=argparse.SUPPRESS)
+    desktop_subparsers.add_parser("remove-backends", help=argparse.SUPPRESS)
     restart_parser = subparsers.add_parser("restart", help="Restart all services")
     restart_parser.add_argument(
         "--delay-seconds",
@@ -18502,6 +18562,7 @@ _CLI_COMMAND_FLOORS: dict[tuple[str, ...], Optional[str]] = {
     ("check-update",): None,
     ("status",): None,
     ("desktop", "endpoint"): "member",
+    ("desktop", "remove-backends"): "member",
     # Host scope, not instance scope: these act on this machine's screen and on
     # authored files, and have no role contract to repair here.
     ("screenshot",): None,
@@ -18738,10 +18799,14 @@ def _dispatch_parsed_command(parser: argparse.ArgumentParser, args) -> None:
     """Run the admitted command. Every branch exits; nothing returns to ``main``."""
 
     if args.command == "stop":
+        if args.keep_remote_access and args.expect_runtime_id is None:
+            parser.error("--keep-remote-access requires --expect-runtime-id")
         if args.receipt is not None:
             sys.exit(cmd_stop(receipt=args.receipt))
         if args.expect_runtime_id is not None:
-            sys.exit(cmd_stop(expect_runtime_id=args.expect_runtime_id))
+            sys.exit(
+                cmd_stop(expect_runtime_id=args.expect_runtime_id, keep_remote_access=args.keep_remote_access)
+            )
         sys.exit(cmd_stop())
     if args.command == "start":
         if _generation_downgrade_blocks("start", allow_downgrade=args.allow_downgrade):
@@ -18749,6 +18814,8 @@ def _dispatch_parsed_command(parser: argparse.ArgumentParser, args) -> None:
         sys.exit(cmd_start(open_browser=args.open_browser))
     if args.command == "desktop" and args.desktop_command == "endpoint":
         sys.exit(cmd_desktop_endpoint())
+    if args.command == "desktop" and args.desktop_command == "remove-backends":
+        sys.exit(cmd_desktop_remove_backends())
     if args.command == "restart":
         if _generation_downgrade_blocks("restart", allow_downgrade=args.allow_downgrade):
             sys.exit(1)
