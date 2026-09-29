@@ -1012,6 +1012,7 @@ class ModelHubService:
         self._runtime_install_reconcile_lock = asyncio.Lock()
         self._runtime_install_reconciled = False
         self._runtime_lifecycle_lock = asyncio.Lock()
+        self._runtime_resume_task: asyncio.Task[None] | None = None
         self._builtin_snapshot_generations: dict[BackendName, str] = {}
         self._builtin_snapshot_cache: dict[BackendName, list[dict[str, Any]]] = {}
         self._pending_builtin_catalog_refresh: set[BackendName] = set()
@@ -1593,7 +1594,12 @@ class ModelHubService:
             return recovered if isinstance(recovered, EngineStatus) else None
 
     async def recover_runtime_intent(self) -> None:
-        """Restore the runtime only when the user left it enabled."""
+        """Recover credential custody, then resume a runtime the user left enabled.
+
+        Only custody recovery gates service readiness. Resuming may first
+        download the engine, so it runs in the background, retired by `stop()`;
+        every consumer prepares the engine on demand in the meantime.
+        """
 
         try:
             await recover_native_migration(self)
@@ -1602,12 +1608,32 @@ class ModelHubService:
             # writer or native launch. Controller recovery preserves this gate.
             self.migration_blocked_backends.update(MODEL_HUB_BACKENDS)
             raise ModelHubError("migration_item_conflict", status=409) from None
-        async with self._runtime_lifecycle_lock:
+        task = self._runtime_resume_task
+        if task is None or task.done():
+            self._runtime_resume_task = asyncio.create_task(
+                self._resume_runtime_intent(),
+                name="model-hub-runtime-resume",
+            )
+
+    async def _resume_runtime_intent(self) -> None:
+        try:
             await self.reconcile_runtime_installation()
             if not self.store.load().enabled:
                 return
+            # Preparing may download the engine. Like every demand path, it
+            # holds no lifecycle lock, so an explicit start or stop is served
+            # meanwhile instead of after the download.
             await self._prepare_engine_for_demand()
-            await self._engine_call(self.adapter.start())
+            async with self._runtime_lifecycle_lock:
+                # An explicit stop clears the intent; `stop()` retires this
+                # resume. Either way it must not start the engine.
+                if self._runtime_resume_task is not asyncio.current_task():
+                    return
+                if not self.store.load().enabled:
+                    return
+                await self._engine_call(self.adapter.start())
+        except Exception:
+            logger.exception("Model Hub runtime resume failed; the engine is prepared on demand")
 
     async def _ensure_runtime_dependency(
         self,
@@ -1631,6 +1657,12 @@ class ModelHubService:
                 await await_owned_task(task)
             except Exception:
                 logger.warning("Native takeover remains pending during shutdown")
+        resume, self._runtime_resume_task = self._runtime_resume_task, None
+        if resume is not None and not resume.done():
+            # Drain rather than cancel: the installer runs in a worker thread
+            # that cancellation cannot stop, and the adapter must not stop
+            # beneath it. A retired resume never starts the engine.
+            await await_owned_task(resume)
         async with self._runtime_lifecycle_lock:
             await self.adapter.stop()
 
