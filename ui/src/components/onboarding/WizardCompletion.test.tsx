@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { createInstance } from 'i18next';
 import { I18nextProvider } from 'react-i18next';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
@@ -17,7 +17,7 @@ const mock = vi.hoisted(() => ({ control: vi.fn(), toast: vi.fn(), permission: v
   // the collection authority, the lifecycle helper and the take-over dialog underneath
   // them are the real ones, which is what makes the journey below the journey rather
   // than a direct mount of the third screen.
-  models: { listSources: vi.fn(), listAgents: vi.fn(), refreshAgentPresence: vi.fn(), scanMigration: vi.fn(), getRuntimeStatus: vi.fn(), getAgentChain: vi.fn(), previewAgentChain: vi.fn(), putAgentChain: vi.fn() },
+  models: { listSources: vi.fn(), listAgents: vi.fn(), refreshAgentPresence: vi.fn(), scanMigration: vi.fn(), getRuntimeStatus: vi.fn(), createApiKeySource: vi.fn(), getAgentChain: vi.fn(), previewAgentChain: vi.fn(), putAgentChain: vi.fn() },
 }));
 vi.mock('../../context/ApiContext', async (importOriginal) => ({ ...await importOriginal<typeof import('../../context/ApiContext')>(), useApi: () => mock.api }));
 vi.mock('@/lib/apiFetch', async (importOriginal) => ({ ...await importOriginal<typeof import('@/lib/apiFetch')>(), apiFetch: mock.apiFetch }));
@@ -204,6 +204,7 @@ describe('explicit any-one-ready completion', () => {
     expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
     mock.control.mockImplementation(async () => { running = true; return { ok: true, action: 'start' }; });
     mock.api.mutateConfig.mockImplementation(async (mutations) => { persistConfig(mutations); return {}; });
+    await waitFor(() => expect(enter.hasAttribute('disabled')).toBe(false));
     await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Enter workspace' })));
     await screen.findByTestId('destination');
   });
@@ -480,7 +481,10 @@ describe('the correlated entry gate', () => {
     mock.models.listAgents.mockRejectedValue(new Error('engine_down: controller socket absent'));
     mock.models.getRuntimeStatus.mockRejectedValue(new Error('engine_down: controller socket absent'));
     fireEvent.click(enter);
-    expect((await screen.findByRole('alert')).textContent).toContain(en.onboarding.connection.applyPending);
+    // The follow-up inventory read also reports its own route failure on the
+    // cards. The completion refusal remains the separate entry error.
+    await waitFor(() => expect(document.querySelector('.connection-error[role="alert"]')?.textContent)
+      .toContain(en.onboarding.connection.applyPending));
     expect(mock.control).not.toHaveBeenCalled();
     expect(mock.api.mutateConfig).not.toHaveBeenCalled();
     expect(screen.queryByTestId('destination')).toBeNull();
@@ -790,6 +794,108 @@ describe('the registered journey', () => {
   const seeds = () => mock.apiFetch.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'POST');
   const gateway = () => document.querySelector('.setup-gateway')!;
 
+  it('AUTH-SETUP-126: a completion refusal refreshes sources without leaving assistants', async () => {
+    const enter = await setup();
+    // Another client removes the source after the assistant screen's read. The
+    // fresh completion gate sees that its route cannot run, while this screen
+    // still holds the earlier connected source until it asks again.
+    mock.models.listAgents.mockResolvedValue([]);
+    let confirmSources!: (sources: Source[]) => void;
+    mock.models.listSources.mockReturnValue(new Promise<Source[]>((resolve) => { confirmSources = resolve; }));
+    const priorReads = mock.models.listSources.mock.calls.length;
+    fireEvent.click(enter);
+    const error = await screen.findByRole('alert');
+    expect(error.textContent).toContain(en.onboarding.connection.modelUnavailable);
+    await waitFor(() => expect(mock.models.listSources.mock.calls.length).toBeGreaterThan(priorReads));
+    expect(screenId()).toBe('assistants');
+    expect(primaryAction().hasAttribute('disabled')).toBe(true);
+    expect(within(error).getByRole('button', { name: 'Retry' }).hasAttribute('disabled')).toBe(true);
+    expectNoForwardWrite();
+
+    await act(async () => confirmSources([]));
+    const recover = await screen.findByRole('button', { name: 'Add model source' });
+    expect(primaryAction().hasAttribute('disabled')).toBe(true);
+    expect(within(error).getByRole('button', { name: 'Retry' }).hasAttribute('disabled')).toBe(true);
+    fireEvent.click(recover);
+    await waitFor(() => expect(screenId()).toBe('providers'));
+    await waitFor(() => expect(primaryAction().textContent).toContain(en.onboarding.providers.actionAdd));
+    fireEvent.click(primaryAction());
+    expect(await screen.findByRole('dialog')).toBeTruthy();
+    expectNoForwardWrite();
+  });
+
+  it('AUTH-SETUP-126: source recovery cannot reuse the previous visit while inventory readback is pending', async () => {
+    await arriveAtProviders();
+    mock.models.listSources.mockResolvedValue([]);
+    mock.api.getBackendConnection.mockImplementation(async (backend) => ({
+      ok: true, backend, enabled: true, installed: true, auth: 'api_key',
+      application: 'applied', ready: true, entry_eligible: true, supply_mode: 'direct',
+    }));
+    fireEvent.click(primaryAction());
+    const recover = await screen.findByRole('button', { name: 'Add model source' });
+    expect(primaryAction().hasAttribute('disabled')).toBe(true);
+    fireEvent.click(primaryAction());
+    expect(screenId()).toBe('assistants');
+    expect(mock.api.mutateConfig).not.toHaveBeenCalled();
+
+    let confirmSources!: (sources: Source[]) => void;
+    mock.models.listSources.mockReturnValue(new Promise<Source[]>((resolve) => { confirmSources = resolve; }));
+    const runtimeReads = mock.models.getRuntimeStatus.mock.calls.length;
+    fireEvent.click(recover);
+    await waitFor(() => expect(screenId()).toBe('providers'));
+    await waitFor(() => expect(mock.models.getRuntimeStatus.mock.calls.length).toBeGreaterThan(runtimeReads));
+    expect(primaryAction().hasAttribute('disabled')).toBe(true);
+    fireEvent.click(primaryAction());
+    expect(screenId()).toBe('providers');
+
+    await act(async () => confirmSources([]));
+    await waitFor(() => expect(primaryAction().textContent).toContain(en.onboarding.providers.actionAdd));
+    expect(primaryAction().hasAttribute('disabled')).toBe(false);
+    fireEvent.click(primaryAction());
+    expect(await screen.findByRole('dialog')).toBeTruthy();
+    expect(screenId()).toBe('providers');
+  });
+
+  it('AUTH-SETUP-126: requires source readback before the shell can continue to assistants', async () => {
+    mock.models.listSources.mockResolvedValue([]);
+    mount();
+    fireEvent.click(await screen.findByRole('button', { name: 'Get started' }));
+    await waitFor(() => expect(primaryAction().textContent).toContain(en.onboarding.providers.actionAdd));
+    await waitFor(() => expect(primaryAction().hasAttribute('disabled')).toBe(false));
+    expect(screen.queryByRole('button', { name: 'Continue to assistants' })).toBeNull();
+    fireEvent.click(primaryAction());
+    const dialog = await screen.findByRole('dialog');
+    expect(screenId()).toBe('providers');
+    expect(mock.api.mutateConfig).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'API Key' }));
+    fireEvent.change(within(dialog).getByLabelText('Base URL'), { target: { value: 'https://fixture.example/v1' } });
+    fireEvent.change(within(dialog).getByLabelText('API key'), { target: { value: 'sk-fixture' } });
+    let confirmSources!: (sources: Source[]) => void;
+    const readback = new Promise<Source[]>((resolve) => { confirmSources = resolve; });
+    mock.models.createApiKeySource.mockImplementation(async () => {
+      mock.models.listSources.mockReturnValue(readback);
+      return { source: HUB_SOURCE, added_to: [], adopted_by: [] };
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Add' }));
+    await waitFor(() => expect(mock.models.createApiKeySource).toHaveBeenCalledOnce());
+    expect(screenId()).toBe('providers');
+    expect(primaryAction().hasAttribute('disabled')).toBe(true);
+    fireEvent.click(primaryAction());
+    expect(screenId()).toBe('providers');
+
+    await act(async () => {
+      mock.models.listSources.mockResolvedValue([HUB_SOURCE]);
+      confirmSources([HUB_SOURCE]);
+    });
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() => expect(primaryAction().textContent).toContain(en.onboarding.providers.actionContinue));
+    expect(primaryAction().hasAttribute('disabled')).toBe(false);
+    expect(screenId()).toBe('providers');
+    fireEvent.click(primaryAction());
+    await waitFor(() => expect(screenId()).toBe('assistants'));
+  });
+
   it('establishes the controller on arrival at the second screen, never on mount', async () => {
     mount();
     const start = await screen.findByRole('button', { name: 'Get started' });
@@ -861,6 +967,8 @@ describe('the registered journey', () => {
 
   it('holds the journey on a failed establishment, and its own Retry gives it back', async () => {
     mock.models.getRuntimeStatus.mockRejectedValueOnce(new Error('runtime unreadable'));
+    let releaseSources!: (sources: Source[]) => void;
+    mock.models.listSources.mockReturnValue(new Promise<Source[]>((resolve) => { releaseSources = resolve; }));
     mount();
     fireEvent.click(await screen.findByRole('button', { name: 'Get started' }));
     await waitFor(() => expect(gateway().getAttribute('data-state')).toBe('failed'));
@@ -868,7 +976,12 @@ describe('the registered journey', () => {
     // step, and the one Retry on screen is the card's rather than the footer's.
     expect(gateway().hasAttribute('data-failed-step')).toBe(false);
     expect(flowError()).toBeNull();
-    expect(primaryAction().textContent).toContain(en.onboarding.providers.actionContinue);
+    // Runtime failure does not settle the independent inventory read. Keep that
+    // boundary controlled so the assertion cannot race its source response in CI.
+    expect(primaryAction().textContent).toContain(en.onboarding.providers.actionChecking);
+    expect(primaryAction().hasAttribute('disabled')).toBe(true);
+    await act(async () => releaseSources([HUB_SOURCE]));
+    await waitFor(() => expect(primaryAction().textContent).toContain(en.onboarding.providers.actionContinue));
     expect(primaryAction().hasAttribute('disabled')).toBe(true);
     const retry = gateway().querySelector('.setup-gateway-retry') as HTMLButtonElement;
     expect(retry.textContent).toContain(en.common.retry);

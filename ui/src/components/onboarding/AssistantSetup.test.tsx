@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { StrictMode } from 'react';
+import { createRef, StrictMode } from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { createInstance } from 'i18next';
 import { I18nextProvider } from 'react-i18next';
@@ -9,8 +9,9 @@ import { AgentDetection } from '../steps/AgentDetection';
 import { AssistantRow } from './AssistantRow';
 import en from '../../i18n/en.json';
 import type { BackendConnectionState } from '../../context/ApiContext';
+import type { Source } from '../settings/models/types';
 import { RouteSurfaceActiveContext } from '../../lib/routeSurfaceActivity';
-import type { SetupAction } from './setupFlow';
+import type { SetupAction, SetupScreenHandle } from './setupFlow';
 import { INITIAL_SETUP_FLOW_STATE } from './setupFlow';
 
 const mock = vi.hoisted(() => ({ api: {
@@ -57,6 +58,11 @@ const hubReads = {
   refresh: async () => ({ kind: 'current' as const, value: [] }),
   readValue: async () => [{ backend: 'claude' as const, cli_present: true, mode: 'hub' as const, menu_kind: 'fixed' as const, named_agents: [{ name: 'claude', effective_model_id: 'opus-5', supply_status: 'ok' as const }] }],
   invalidate: () => undefined,
+};
+const setupSource: Source = {
+  id: 'src_a', vendor: 'anthropic', display_name: 'Fixture source', kind: 'api_key',
+  protocol: 'anthropic', supply_channel: 'hub', billing: 'metered',
+  state: { status: 'active' }, models: [], last_discovered_at: null,
 };
 beforeEach(() => {
   vi.resetAllMocks();
@@ -652,6 +658,97 @@ describe('assistant installation presentation', () => {
 });
 
 describe('Hub route refresh', () => {
+  it.each([false, true])('AUTH-SETUP-126: returns to providers with an empty inventory (direct eligible: %s)', async (directEligible) => {
+    const saved = { ...data(), capabilities: { model_hub: { enabled: true } } };
+    saved.agents.claude.status = 'ok';
+    mock.api.getBackendConnection.mockImplementation(async (backend) => ({
+      ok: true, backend, installed: true, enabled: true, auth: 'none',
+      application: 'applied', ready: directEligible, entry_eligible: directEligible,
+      supply_mode: directEligible ? 'direct' : 'hub',
+    }));
+    const listed = pending<[]>();
+    mock.models.listSources.mockReturnValue(listed.promise);
+    const navigate = vi.fn();
+    const props = { data: saved, onNext: vi.fn(), onNavigate: navigate, agentReads: hubReads };
+    const view = render(wrap(<AgentDetection {...props} />));
+    await waitFor(() => expect(mock.models.listSources).toHaveBeenCalled());
+    expect(screen.queryByRole('button', { name: 'Add model source' })).toBeNull();
+    await waitFor(() => expect(mock.api.getBackendConnection).toHaveBeenCalledTimes(3));
+    const pendingEntry = screen.getByRole<HTMLButtonElement>('button', { name: 'Enter workspace' });
+    expect(pendingEntry.disabled).toBe(true);
+    fireEvent.click(pendingEntry);
+    expect(props.onNext).not.toHaveBeenCalled();
+    await act(async () => listed.resolve([]));
+    const recover = await screen.findByRole<HTMLButtonElement>('button', { name: 'Add model source' });
+    expect(screen.getByText(en.onboarding.connection.sourceRequired)).toBeTruthy();
+    expect(recover.disabled).toBe(false);
+    const enter = screen.getByRole<HTMLButtonElement>('button', { name: 'Enter workspace' });
+    expect(enter.disabled).toBe(true);
+    fireEvent.click(enter);
+    fireEvent.click(recover);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith('providers');
+    expect(props.onNext).not.toHaveBeenCalled();
+    view.rerender(wrap(<AgentDetection {...props} active={false} />));
+    expect(screen.queryByRole('button', { name: 'Add model source' })).toBeNull();
+  });
+
+  it('AUTH-SETUP-126: failed provider evidence blocks entry and retries the inventory read', async () => {
+    const saved = { ...data(), capabilities: { model_hub: { enabled: true } } };
+    saved.agents.claude.status = 'ok';
+    mock.models.listSources.mockRejectedValue(new Error('fixture unavailable'));
+    const onNext = vi.fn();
+    render(wrap(<AgentDetection data={saved} onNext={onNext} onNavigate={vi.fn()} agentReads={hubReads} />));
+    const message = await screen.findByText(en.onboarding.connection.readFailed);
+    const enter = screen.getByRole<HTMLButtonElement>('button', { name: 'Enter workspace' });
+    expect(enter.disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Add model source' })).toBeNull();
+    enter.removeAttribute('disabled');
+    fireEvent.click(enter);
+    expect(onNext).not.toHaveBeenCalled();
+
+    mock.models.listSources.mockResolvedValue([setupSource]);
+    fireEvent.click(within(message.parentElement!).getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(enter.disabled).toBe(false));
+    expect(screen.queryByText(en.onboarding.connection.readFailed)).toBeNull();
+    fireEvent.click(enter);
+    await waitFor(() => expect(onNext).toHaveBeenCalledOnce());
+  });
+
+  it.each(['empty', 'native', 'pending', 'failed'] as const)('AUTH-SETUP-126: stale completion retry cannot bypass %s provider evidence', async (inventory) => {
+    const saved = { ...data(), capabilities: { model_hub: { enabled: true } } };
+    saved.agents.claude.status = 'ok';
+    mock.models.listSources.mockResolvedValue([setupSource]);
+    const onNext = vi.fn().mockRejectedValue(new Error('fixture completion failed'));
+    const handle = createRef<SetupScreenHandle>();
+    const props = { ref: handle, data: saved, onNext, onNavigate: vi.fn(), agentReads: hubReads };
+    const view = render(wrap(<AgentDetection {...props} active />));
+    const enter = screen.getByRole<HTMLButtonElement>('button', { name: 'Enter workspace' });
+    await waitFor(() => expect(enter.disabled).toBe(false));
+    fireEvent.click(enter);
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('fixture completion failed');
+    expect(onNext).toHaveBeenCalledOnce();
+
+    view.rerender(wrap(<AgentDetection {...props} active={false} />));
+    const read = pending<Source[]>();
+    mock.models.listSources.mockReturnValue(read.promise);
+    view.rerender(wrap(<AgentDetection {...props} active />));
+    if (inventory === 'failed') await act(async () => read.reject(new Error('fixture unavailable')));
+    else if (inventory !== 'pending') await act(async () => read.resolve(inventory === 'native'
+      ? [{ ...setupSource, kind: 'subscription', supply_channel: 'native_cli' }] : []));
+
+    const retry = within(alert).getByRole<HTMLButtonElement>('button', { name: 'Retry' });
+    expect(enter.disabled).toBe(true);
+    expect(retry.disabled).toBe(true);
+    retry.removeAttribute('disabled');
+    fireEvent.click(retry);
+    await act(async () => handle.current?.activate());
+    expect(onNext).toHaveBeenCalledOnce();
+    if (inventory === 'empty' || inventory === 'native') {
+      expect(screen.getByRole('button', { name: 'Add model source' })).toBeTruthy();
+    }
+  });
+
   it.each(['direct', 'hub'] as const)('uses current %s route ownership when the connection read fails', async (mode) => {
     const saved = { ...data(), capabilities: { model_hub: { enabled: true } } };
     saved.agents.claude.status = 'ok';
@@ -983,7 +1080,7 @@ describe('Hub route refresh', () => {
     mock.api.listVibeAgents.mockResolvedValue({ ok: true, agents: [hubAgent()], default_agent_name: 'claude' });
     mock.api.getVibeAgent.mockResolvedValue({ ok: true, agent: hubAgent() });
     mock.models.getAgentChains.mockResolvedValue([hubChain('shared-id')]);
-    mock.models.listSources.mockResolvedValue([{ id: 'src_a', models: [] }]);
+    mock.models.listSources.mockResolvedValue([{ id: 'src_a', state: { status: 'active' }, models: [] }]);
     const reads = { ...hubReads, read: async () => ({ kind: 'current' as const, value: [
       { backend: 'claude' as const, cli_present: true, mode: 'hub' as const, menu_kind: 'fixed' as const },
       { backend: 'codex' as const, cli_present: true, mode: 'hub' as const, menu_kind: 'fixed' as const,
@@ -1080,7 +1177,7 @@ describe('Hub route refresh', () => {
       application: 'applied', ready: backend !== 'opencode' || opencodeEnabled,
       entry_eligible: backend !== 'opencode' || opencodeEnabled, supply_mode: 'hub',
     }));
-    mock.models.listSources.mockResolvedValue([{ id: 'src_a', models: [{ id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol' }] }]);
+    mock.models.listSources.mockResolvedValue([{ id: 'src_a', state: { status: 'active' }, models: [{ id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol' }] }]);
     mock.models.getAgentChains.mockResolvedValue([{ ...hubChain('gpt-5.6-sol'), backend: 'opencode', model_id: 'gpt-5.6-sol',
       chain: [
         { source_id: 'src_a', model_id: 'gpt-5.6-sol', channel: 'hub', health: 'healthy', runnable: true },

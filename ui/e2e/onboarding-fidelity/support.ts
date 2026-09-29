@@ -1,4 +1,4 @@
-import type { Page, Route } from '@playwright/test';
+import { expect, type Page, type Route } from '@playwright/test';
 
 export const ORIGIN = 'http://127.0.0.1:5212';
 
@@ -85,7 +85,7 @@ export async function serveProduct(page: Page) {
     return route.fulfill({ json: { ok: true, agent: { backend, mode: 'direct', sources: { order: [], eligibility: [] }, routes: {}, builtin_models: [], catalog_models: [], named_agents: [], menu: null, model_supply: [], supply_status: 'unavailable' } } });
   });
   await page.route('**/api/models/runtime/status', (route) => route.fulfill({ json: { ok: true, runtime: { contract_version: 10, enabled: true, host_platform: 'linux', manifest: { name: 'cliproxyapi', resolution: 'resolved', version: 'fixture', source_sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', assets: [] }, status: { installed_version: 'fixture', verified: true, health: 'ok' } } } }));
-  await page.route('**/status', (route) => route.fulfill({ json: { state: 'running' } }));
+  await page.route(`${ORIGIN}/status`, (route) => route.fulfill({ json: { state: 'running' } }));
   await page.route('**/api/backend/*/connection', (route) => route.fulfill({ json: { ok: true, backend: new URL(route.request().url()).pathname.split('/').at(-2), installed: true, enabled: true, auth: 'none', application: 'applied', ready: false, entry_eligible: false } }));
   await page.route('**/api/config', (route) => route.fulfill({ json: CONFIG }));
   await page.route('**/api/platforms', (route) => route.fulfill({ json: CATALOG }));
@@ -239,15 +239,27 @@ export async function setDocumentHidden(page: Page, hidden: boolean) {
 }
 
 export async function openSetup(page: Page, lang: string) {
+  // Assistant captures enter through the same prerequisite as the product. Keep this
+  // source local to this helper so provider-empty cases still begin without one.
+  await page.route('**/api/models/sources', (route) => route.fulfill({ json: { sources: [{
+    id: 'src_setup_fixture', vendor: 'openai', kind: 'api_key', display_name: 'OpenAI',
+    protocol: 'openai_chat', supply_channel: 'hub', billing: 'metered',
+    state: { status: 'active' }, models: [], last_discovered_at: null,
+  }] } }));
   await page.getByRole('button', { name: lang === 'zh' ? '立即开始' : 'Get started' }).click();
   // The handoff timer uses the same browser clock as the story in deterministic runs.
   await page.clock.runFor(950);
-  // Providers is the first step now. This fixture answers「no sources」and leaves the
-  // Hub unready, so the connection action is disabled and the way on the screen states
-  // is the only control that leaves it — which is how a person gets to the assistants
-  // here, and so how the capture does. Addressed by the hint's own class rather than
-  // its sentence, because these captures run in both languages.
-  await page.locator('.onboarding-setup-hint button').click();
+  const onward = lang === 'zh' ? '继续，选择 AI 助手' : 'Continue to assistants';
+  const primary = page.locator('.onboarding-primary-action');
+  await expect(primary).toBeEnabled();
+  // A capture may also detect native keys. Decline that optional migration through
+  // its own review; the existing source above is what permits continuing.
+  if ((await primary.textContent())?.trim() !== onward) {
+    await expect(primary).toContainText(lang === 'zh' ? '迁移' : 'Migrate');
+    await primary.click();
+    await page.getByRole('dialog').getByRole('button', { name: lang === 'zh' ? '暂不迁移' : 'Not now', exact: true }).click();
+  }
+  await page.getByRole('button', { name: onward }).click();
   await page.clock.runFor(950);
   await page.locator('[data-setup-screen="assistants"]').waitFor();
   await page.locator('.onboarding-assistants').waitFor();
