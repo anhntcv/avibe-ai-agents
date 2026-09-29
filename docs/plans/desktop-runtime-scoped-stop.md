@@ -1,6 +1,7 @@
 # Desktop Runtime scoped stop and installer ownership
 
-Refs #2135 (Python half), #2131.
+Refs #2135, #2131. PR 2a is the Python half; PR 2b is the desktop host and
+removes the startup receipt from both sides.
 
 ## Outcome and boundaries
 
@@ -8,14 +9,17 @@ A desktop app must update smoothly and never stop a Runtime it did not start.
 Authority to stop follows provenance: the desktop host knows which Runtime id its
 bundle started, and asks Python to stop only processes that carry that id. The
 scoped stop reads no file: no pidfile, lock record or installer record decides
-what is signalled. `/ready` and `/internal/health` are unchanged, and so are
-plain `vibe stop` and `vibe stop --receipt`.
+what is signalled. `/ready` and `/internal/health` are unchanged, and so is
+plain `vibe stop`. The startup receipt (`@avibe-start-receipt:` and
+`vibe stop --receipt`) is gone: provenance is the Runtime id, not a receipt the
+host has to keep.
 
 ## `vibe stop --expect-runtime-id <RUNTIME_ID>`
 
 `RUNTIME_ID` is the 64-character lowercase hex `AVIBE_DESKTOP_RUNTIME_ID` the
 desktop host exports to the Runtime it launches. Every process that Runtime
-starts inherits it. The flag is mutually exclusive with `--receipt`.
+starts inherits it. The stop also stops the home's tunnel connector, under the
+rule in the ledger below.
 
 ### Discovery is one scan
 
@@ -96,13 +100,22 @@ are never localized; the exit-2 diagnostics go through `vibe/i18n/`
 
 ## Handover
 
-When a desktop `vibe start` finds a controller whose health names another
-desktop Runtime id, it calls the same `runtime.stop_desktop_runtime` with that
-observed id and fails the start if the stop is refused or fails. It also fails
-the start if the UI pidfile still names a running UI afterwards: that UI is not
-the superseded Runtime's, and the start would otherwise reuse it or replace it
-with an unscoped stop. The tunnel connector is left for the successor to adopt.
-These errors go through `vibe/i18n/` (`desktopRuntime.handover*`).
+`vibe start` alone owns the act of replacing a superseded desktop Runtime, and
+does it only when asked with `--hand-over`, a hidden flag the desktop host
+passes on app launch or a user Retry. When a desktop `vibe start` finds a
+controller whose health names another desktop Runtime id:
+
+- without `--hand-over` it exits 3 and leaves that Runtime running;
+- with it, it calls the same `runtime.stop_desktop_runtime` with that observed
+  id, and exits 3 if the stop is refused and 2 if it fails;
+- it also exits 3 if the UI pidfile still names a running UI afterwards: that
+  UI is not the superseded Runtime's, and the start would otherwise reuse it or
+  replace it with an unscoped stop.
+
+Exit 3 means this start did not take the home over; exit 2 means the superseded
+Runtime may be left partly running. `runtime.stop_desktop_runtime` never stops
+the tunnel connector, so the successor adopts it. These errors go through
+`vibe/i18n/` (`desktopRuntime.handover*`).
 
 ## Backend installer ownership (#2131)
 
@@ -214,11 +227,23 @@ These errors go through `vibe/i18n/` (`desktopRuntime.handover*`).
 
 ## Known-by-design ledger
 
-- Programs without a role that carry the id, such as agent CLIs and the tunnel
-  connector, are listed in `left_running` and never signalled. They are either
-  children of a stopped role process or, like the connector, kept for adoption.
-- The scoped stop does not stop remote access: that path acts on the
-  connector's files. The handover leaves the tunnel for the successor.
+- Programs without a role that carry the id, such as agent CLIs, are listed in
+  `left_running` and never signalled; they are children of a stopped role
+  process.
+- The tunnel connector serves the home, not one Runtime. After a successful
+  scoped stop it is stopped through its own files, and only while the stop holds
+  the free service lock and no UI of the home is running. A held lock leaves it
+  to that service. A handover inside `vibe start` never stops it, so the
+  successor adopts the tunnel, and the next UI start's
+  `remote_access.reconcile()` brings a stopped tunnel back after Quit.
+- argparse usage errors also exit 2, so a `vibe start` too old to know
+  `--hand-over` reads as a handover that may have left the predecessor partly
+  running. The bundled launcher is always the same version, so this cannot
+  happen, and the reading fails closed. No other `vibe start` path exits 2 or 3.
+- A `vibe restart` or plain `vibe stop` run by a process a superseded Runtime
+  left running still acts on the Controller unscoped, because its desktop
+  identity was stripped with its old root. Claiming by the caller's own id
+  belongs at the start and restart boundary, tracked in #2135 for PR 3.
 - A role process in the stop's own lineage is never signalled and fails the
   stop; a program without a role in the lineage is not listed.
 - The scoped stop path reads no file: no pidfile, lock record or installer
@@ -257,15 +282,35 @@ These errors go through `vibe/i18n/` (`desktopRuntime.handover*`).
   landing on a UI. An owner launched outside the UI's `-c` shape, which Avibe
   never does, reads as reused on a shifted create time, as before this rule.
 
-## Consumer notes for the desktop host (PR2)
+## Desktop host (PR 2b)
 
-- Pass `--expect-runtime-id` for handover, Quit and uninstall. Exit 3 means
-  nothing was touched; parse the JSON reason. `service_runtime_id_mismatch` is
-  Foreign; `service_identity_unavailable` is Unknown, to be retried and never
-  treated as Absent.
-- Exit 2 means a process or installer tree of this Runtime may still be
-  running: do not replace or remove the bundle. `remaining` names each one.
-- `left_running` lists the other programs carrying the id. For Quit and
-  uninstall the tunnel connector is among them; stop it separately if the
-  tunnel should not outlive the app.
-- Uninstall should take the backend's `.install.lock` before removing its root.
+`HealthProbe::presence` classifies the origin: `Mine{ready}` (this bundle's id),
+`Foreign{id, ready}`, `Unmanaged` (no id), `Absent` (connection refused) or
+`Unknown` (any other failure). Each probe has 5 s, because Windows refuses a
+loopback connect only after about 2 s of SYN resends. The host runs one stop verb,
+`vibe stop --expect-runtime-id <id>`, mapped as exit 0 → `Completed`, 3 →
+`Refused{reason}`, 2 → `Failed{part}`, any other exit → `Failed{unknown}`, and a
+spawn error → `Unrunnable`. The host never stops a predecessor itself.
+
+- B1, initial: `Mine{ready}` → adopt; `Mine{!ready}`, `Absent`, `Unknown` and
+  `Foreign` → launch; `Unmanaged` → adopt as external. The host owns only the
+  handover policy: its launch passes `--hand-over` on app launch or a user
+  Retry, never from monitor recovery. Recovery that sees `Foreign` shows
+  `runtime_ownership_lost` and launches nothing.
+- The start helper's exit decides a handover: 3 → `runtime_ownership_lost`,
+  2 after `--hand-over` → `runtime_stop_failed`, any other non-zero exit →
+  `launcher_exited`.
+- B4, polling: `Mine{ready}` → Ready; `Unmanaged` → Adopted. B5: `Foreign` is
+  judged only once this app's helper has exited, because until then it may be
+  the predecessor the helper is replacing. One still serving after that was not
+  replaced, and shows `runtime_ownership_lost`.
+- B6, monitor: the Runtime is serving while presence stays the adopted class.
+- B7, uninstall: only `Mine`, or `Absent` with no launch in flight, is stopped
+  by the bundle's id, then its backends and bundle are removed. Any other
+  presence, a refusal or a failure keeps every file. When the CLI cannot run
+  at all and presence is `Absent` with no launch in flight, a native dialog
+  offers "Delete Anyway" or "Keep Files".
+- B8, Stop and Quit: offered only while the last presence is `Mine`. A refusal
+  shows `runtime_ownership_lost`; a failure shows `runtime_stop_failed`.
+- `Unknown` → launch relies on the start boundary, tracked in
+  https://github.com/avibe-bot/avibe/issues/2135#issuecomment-5877263657.
