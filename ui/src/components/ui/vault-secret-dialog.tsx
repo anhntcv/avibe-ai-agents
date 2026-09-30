@@ -1,5 +1,5 @@
 import { KeyRound, Pencil } from 'lucide-react';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import type { VaultRequest, VaultRequestSpec, VaultSecret } from '@/context/ApiContext';
@@ -25,6 +25,9 @@ export const VaultSecretDialog: React.FC<{
   request?: VaultRequest | null;
   /** An existing secret to edit (value-free metadata); mutually exclusive with create/provide. */
   editSecret?: VaultSecret | null;
+  /** Start on the Protected tier even when a provision request defaults to Standard: a browser
+   *  handoff carries the user's choice of Protected. It can only raise the tier, never lower it. */
+  startProtected?: boolean;
   /** Rendered in place of the form (loading / ambiguous-provision notices from callers). */
   notice?: React.ReactNode;
   onCancel?: () => void;
@@ -41,6 +44,7 @@ export const VaultSecretDialog: React.FC<{
   name,
   request,
   editSecret,
+  startProtected = false,
   notice,
   onCancel,
   cancelLabel,
@@ -52,9 +56,18 @@ export const VaultSecretDialog: React.FC<{
   const { t } = useTranslation();
   const [denyConfirmationOpen, setDenyConfirmationOpen] = useState(false);
   const card = (request?.card ?? null) as { default_protection?: unknown; spec?: VaultRequestSpec } | null;
-  const requestSpec = (card?.spec ?? null) as VaultRequestSpec | null;
-  const defaultProtection =
-    card?.default_protection === 'standard' || card?.default_protection === 'protected' ? card.default_protection : undefined;
+  const cardSpec = (card?.spec ?? null) as VaultRequestSpec | null;
+  // The form starts on the spec's tier before `defaultProtection`, and the card derives its default
+  // from that same spec, so a handoff's Protected must replace the tier in both.
+  const requestSpec = useMemo(
+    () => (cardSpec && startProtected ? { ...cardSpec, protection: 'protected' as const } : cardSpec),
+    [cardSpec, startProtected],
+  );
+  const defaultProtection = startProtected
+    ? 'protected'
+    : card?.default_protection === 'standard' || card?.default_protection === 'protected'
+      ? card.default_protection
+      : undefined;
   const fixedName = name ?? request?.secret_name ?? undefined;
   const isProvide = Boolean(fixedName);
   const isEdit = Boolean(editSecret);
