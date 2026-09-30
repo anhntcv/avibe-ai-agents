@@ -142,6 +142,7 @@ def _build_agent(active_polls: dict[str, ActivePollInfo], *, language: str = "en
     agent._user_stopped_sessions = set()
     agent._steering_states = {}
     agent._restored_poll_servers = {}
+    agent._settling_request_tasks = set()
 
     server = _Server()
     agent._client_manager = SimpleNamespace(_server_manager=server)
@@ -1107,6 +1108,75 @@ def test_restore_settles_incomplete_assistant_when_unknown_status_recovers_idle(
     assert reconciled_messages[-1]["info"]["error"]["name"] == (
         "NativeSessionEndedBeforeResult"
     )
+
+
+@pytest.mark.parametrize("stall", ["cleanup", "steering_lock", "retiring"])
+def test_forced_refresh_neither_waits_on_nor_strands_a_stuck_restored_poll(stall) -> None:
+    """MH-MIG-009: switching to the gateway interrupts a restored poll. The
+    teardown must not wait on the poll, whether its cancellation cleanup hangs
+    or it holds its steering lock across a native call; and once the poll does
+    settle it must retire its durable record, or the next restart restores a
+    run the user chose to interrupt. A poll that finished on its own and is
+    already retiring must be left to finish that retirement."""
+    poll = _make_poll(platform="avibe", base_session_id="ses_wb", opencode_session_id="oc-1")
+    if stall == "steering_lock":
+        poll.processing_indicator = {
+            "platform": "avibe",
+            "opencode_native_steering": {"target_session_id": "ses_wb", "logical_turn_id": "logical-restored"},
+        }
+    active_polls = {"oc-1": poll}
+    agent, _, removed, _ = _build_agent(active_polls)
+    polling, release = asyncio.Event(), asyncio.Event()
+    recancelled = []
+
+    if stall == "retiring":
+        async def slow_mark_run_inactive(session_id):
+            polling.set()
+            await release.wait()
+            agent._test_inactive_runs.append(session_id)
+
+        agent._test_server.mark_run_inactive = slow_mark_run_inactive
+
+    async def run_restored_poll_loop(poll_info):
+        if stall == "retiring":
+            return True
+        if stall == "steering_lock":
+            # A native call made through the steering-aware server holds the lock.
+            async with agent._steering_states["ses_wb"].lock:
+                polling.set()
+                await asyncio.Event().wait()
+        polling.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                recancelled.append(True)
+            raise
+
+    agent._poll_loop.run_restored_poll_loop = run_restored_poll_loop
+
+    async def run() -> None:
+        assert await agent.restore_active_polls() == 1
+        await polling.wait()
+        tasks = list(agent._active_requests.values())
+        await asyncio.wait_for(agent._cancel_active_requests(), timeout=5)
+        if stall == "cleanup":
+            assert active_polls == {"oc-1": poll}
+            # A second forced refresh, such as a retried switch, must leave the
+            # task's cleanup alone rather than cancel it mid-retirement.
+            await asyncio.wait_for(agent._cancel_active_requests(), timeout=5)
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(run())
+    assert recancelled == []
+    assert agent._active_requests == {}
+    assert agent._settling_request_tasks == set()
+    assert agent._test_inactive_runs == ["oc-1"]
+    assert removed == ["oc-1"]
+    assert active_polls == {}
 
 
 def test_restored_avibe_poll_marks_session_running():

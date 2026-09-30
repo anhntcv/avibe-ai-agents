@@ -764,6 +764,10 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
         self._session_last_activity: Dict[str, float] = {}
         self._steering_states: Dict[str, _OpenCodeSteerState] = {}
         self._restored_poll_servers: Dict[asyncio.Task, _SteeringAwareOpenCodeServer] = {}
+        # Request tasks already settling, interrupted by a forced refresh or in
+        # their own cleanup. A forced refresh never cancels these again, and a
+        # restored poll it interrupted retires its own durable record.
+        self._settling_request_tasks: set[asyncio.Task] = set()
 
     async def _get_server(self) -> OpenCodeServerManager:
         current_task = asyncio.current_task()
@@ -1168,6 +1172,8 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
         Settings writes take effect without terminating active serve
         processes; fall back to restart for older OpenCode versions.
         """
+        if force:
+            await self._cancel_active_requests()
         previous_server = await self._client_manager.reset_config(opencode_config)
         if previous_server is None:
             previous_server = await OpenCodeServerManager.get_instance_if_managed_server_exists(
@@ -1211,6 +1217,36 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
                     port=opencode_config.port,
                     request_timeout_seconds=opencode_config.request_timeout_seconds,
                 )
+
+    async def _cancel_active_requests(self) -> None:
+        """Cancel every request task before a forced server teardown.
+
+        Turn owners cancel foreground requests first; restored polls have no
+        owner, so without this they would poll the stopped server until their
+        failure limit and report a transport error for an intended interrupt.
+        """
+        cancelled: list[asyncio.Task] = []
+        for base_session_id, task in list(self._active_requests.items()):
+            # Cancelling a task that is already settling could abort the
+            # retirement in its cleanup.
+            if task.done() or task in self._settling_request_tasks:
+                continue
+            state = self._steering_states.get(base_session_id)
+            if state is not None and state.task is task:
+                state.closing = True
+            self._settling_request_tasks.add(task)
+            task.add_done_callback(self._settling_request_tasks.discard)
+            # Cancel without the steering lock, which the task itself may hold
+            # across a native call, and without a native abort: the teardown
+            # that follows ends the native run.
+            task.cancel()
+            cancelled.append(task)
+        if cancelled:
+            # Bounded like force_cancel_backend_turns: a stuck cleanup must not
+            # hold the teardown, and retirement does not depend on this wait.
+            # A task still settling keeps its session, as /stop and a new
+            # request already wait for it, so no successor shares its record.
+            await asyncio.wait(cancelled, timeout=2.0)
 
     async def handle_message(self, request: AgentRequest) -> None:
         lock = self._session_manager.get_session_lock(request.base_session_id)
@@ -3026,6 +3062,11 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
                     err,
                 )
         finally:
+            interrupted = current_task in self._settling_request_tasks
+            if current_task is not None:
+                # Settling from here on, however the poll ended.
+                self._settling_request_tasks.add(current_task)
+                current_task.add_done_callback(self._settling_request_tasks.discard)
             await self._stop_caller_context_binding_renewal(
                 caller_context_binding_renewal
             )
@@ -3036,11 +3077,15 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
                     steer_state.closing = True
                 if self._steering_states.get(poll_info.base_session_id) is steer_state:
                     self._steering_states.pop(poll_info.base_session_id, None)
-            if terminal_poll_cleanup and server is not None:
+            if (terminal_poll_cleanup or interrupted) and server is not None:
                 await self._retire_active_poll(
                     server,
                     poll_info.opencode_session_id,
                 )
+            elif interrupted:
+                # Interrupted before registering a run marker: only the durable
+                # record would bring the run back after a restart.
+                self.sessions.remove_active_poll(poll_info.opencode_session_id)
             if caller_context_binding_token and not self._active_poll_is_persisted(
                 poll_info.opencode_session_id
             ):

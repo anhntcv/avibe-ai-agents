@@ -1921,21 +1921,33 @@ class AgentAuthServiceTests(_IsolatedClaudeConfigDirMixin, unittest.IsolatedAsyn
             port=4096,
             request_timeout_seconds=60,
         )
+        calls = []
         previous_server = SimpleNamespace(
             binary="/opencode",
             port=4096,
             request_timeout_seconds=60,
             refresh_global_config=AsyncMock(return_value=True),
-            detach_after_deferred_refresh=AsyncMock(),
+            detach_after_deferred_refresh=AsyncMock(side_effect=lambda **_kw: calls.append(("detach", restored_poll.done()))),
             reload_runtime_config=AsyncMock(),
         )
+        # A poll restored after a restart has no turn owner to cancel it; left
+        # running, it would poll the stopped server and surface a transport
+        # error for an interruption the user chose.
+        restored_poll = asyncio.create_task(asyncio.Event().wait())
         agent = OpenCodeAgent.__new__(OpenCodeAgent)
         agent.opencode_config = old_config
         agent.controller = SimpleNamespace(config=SimpleNamespace(opencode=old_config))
-        agent._client_manager = SimpleNamespace(reset_config=AsyncMock(return_value=previous_server))
+        agent._client_manager = SimpleNamespace(
+            reset_config=AsyncMock(return_value=previous_server),
+        )
+        agent._active_requests = {"base-restored": restored_poll}
+        agent._steering_states = {}
+        agent._settling_request_tasks = set()
 
         await agent.refresh_runtime_config(new_config, force=True)
 
+        self.assertTrue(restored_poll.cancelled())
+        self.assertEqual(calls, [("detach", True)])
         previous_server.refresh_global_config.assert_not_awaited()
         previous_server.detach_after_deferred_refresh.assert_awaited_once_with(force=True)
         previous_server.reload_runtime_config.assert_awaited_once_with(

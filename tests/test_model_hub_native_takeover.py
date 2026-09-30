@@ -610,6 +610,34 @@ def test_rejected_grant_terminal_decision_recovers_after_crash(monkeypatch, tmp_
     assert adapter.revoked == []
 
 
+def test_mode_switch_refuses_an_unreadable_completed_receipt_before_interrupting(monkeypatch, tmp_path):
+    """MH-MIG-009: the pre-guard blocker scan reads the completed receipt; a
+    receipt it cannot trust refuses the switch as mode_switch_blocked, the
+    documented 409, instead of escaping as a server error."""
+    home = tmp_path / "native"
+    _isolate_native_home(monkeypatch, home)
+    service, store, _adapter = _service(tmp_path, migration_home=home)
+    store.config.agents["codex"].mode = "direct"
+    receipt = service.migration_journal.path.with_name("last-completed.json")
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text("{not json")
+    entered = []
+
+    @asynccontextmanager
+    async def guard(backends, *, external_processes=True):
+        entered.append(backends)
+        async def verify():
+            return None
+        yield verify
+
+    service.migration_guard = guard
+    with pytest.raises(ModelHubError) as failure:
+        asyncio.run(service.set_agent_mode("codex", "hub"))
+    assert failure.value.code == "mode_switch_blocked"
+    assert store.config.agents["codex"].mode == "direct"
+    assert entered == []
+
+
 @pytest.mark.parametrize(("backend", "relative", "payload"), [
     ("claude", ".claude/settings.json", "{not json"),
     ("codex", ".codex/config.toml", "model_providers = ["),
@@ -626,8 +654,11 @@ def test_mode_only_adoption_refuses_a_native_config_the_cli_cannot_parse(
     # Nothing is importable, yet the CLI would fail before any Hub override.
     assert not any(item["proposed_action"] == "import" for item in service.migration_scan()["items"])
 
+    entered = []
+
     @asynccontextmanager
     async def guard(backends, *, external_processes=True):
+        entered.append(backends)
         async def verify():
             return None
         yield verify
@@ -637,3 +668,6 @@ def test_mode_only_adoption_refuses_a_native_config_the_cli_cannot_parse(
         asyncio.run(service.set_agent_mode(backend, "hub"))
     assert failure.value.code == "mode_switch_blocked"
     assert store.config.agents[backend].mode == "direct"
+    # MH-MIG-009: the guard interrupts running work, so a switch that is
+    # refused anyway must be refused before it is entered.
+    assert entered == []

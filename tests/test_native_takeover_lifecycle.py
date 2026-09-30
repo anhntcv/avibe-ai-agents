@@ -43,6 +43,8 @@ def controller_fixture(*, backends=("claude", "codex", "opencode"), busy=False):
         session_turns=SimpleNamespace(
             begin_backend_drain=Mock(side_effect=turns.add),
             end_backend_drain=AsyncMock(side_effect=lambda backend, **kw: turns.discard(backend)),
+            active_runtime_session_ids_for_backend=Mock(return_value=set()),
+            release_for_backend_refresh=AsyncMock(return_value=0),
         ),
         model_hub_service=SimpleNamespace(
             migration_blocked_backends=set(), events=SimpleNamespace(path=get_state_dir() / "events.jsonl")
@@ -50,7 +52,8 @@ def controller_fixture(*, backends=("claude", "codex", "opencode"), busy=False):
         config=SimpleNamespace(),
     )
     coordinator = BackendRestartCoordinator(
-        controller, AsyncMock(), process_inventory=Mock(return_value=()), drain_timeout=0.01, poll_interval=0.001,
+        controller, AsyncMock(), process_inventory=Mock(return_value=()), drain_timeout=0.01, settle_timeout=0.01,
+        poll_interval=0.001,
     )
     controller.backend_restart_coordinator = coordinator
     return controller, coordinator, admissions, turns
@@ -172,33 +175,174 @@ async def test_guard_closes_both_admissions_before_retirement_and_retains_only_b
 
 
 @pytest.mark.asyncio
-async def test_busy_guard_never_cancels_or_yields():
+@pytest.mark.parametrize("drain_timeout", [1, 0])
+async def test_busy_guard_interrupts_running_work_then_retires_and_yields(drain_timeout):
+    """MH-MIG-009: every caller applies an explicit user switch, so live work is
+    interrupted, not awaited; a guard that waits for idle leaves the switch spinning.
+    The settle window is independent of the drain timeout, which only decides when
+    a restart stops waiting: an immediate drain must not refuse a brief teardown."""
     controller, coordinator, admissions, turns = controller_fixture(busy=True)
-    with pytest.raises(NativeMigrationBlockedError, match="native_runtime_busy"):
-        async with coordinator.migration_guard(("codex",)):
-            pytest.fail("Mutation admitted while busy")
-    assert admissions == turns == set()
-    controller.agent_service.force_cancel_backend_turns.assert_not_awaited()
-    controller.agent_service.agents["codex"].retire_for_native_migration.assert_not_awaited()
+    service = controller.agent_service
+    coordinator._drain_timeout = drain_timeout
+    coordinator._settle_timeout = 1
+    controller.session_turns.active_runtime_session_ids_for_backend.return_value = {"session-1"}
+    order = []
+    service.force_cancel_backend_turns.side_effect = lambda backend: order.append(("cancel", backend))
+
+    async def teardown(backend, forced):
+        await asyncio.sleep(0.01)
+        order.append(("refresh", backend, forced))
+        service.backend_runtime_active.return_value = False
+
+    coordinator._refresh.side_effect = teardown
+    service.agents["codex"].retire_for_native_migration.side_effect = lambda: order.append("retire")
+    async with coordinator.migration_guard(("codex",)):
+        assert admissions == turns == {"codex"}
+        order.append("mutate")
+    assert order == [("cancel", "codex"), ("refresh", "codex", True), "retire", "mutate"]
+    controller.session_turns.release_for_backend_refresh.assert_awaited_once_with(
+        backend="codex", base_session_ids={"session-1"},
+    )
+    assert not admissions and not turns
 
 
 @pytest.mark.asyncio
-async def test_guard_drains_active_work_naturally():
+@pytest.mark.parametrize("leaves", ["cancelled", "settle_window"])
+async def test_abandoned_switch_keeps_admission_closed_until_teardown_completes(leaves):
+    """MH-MIG-009: an interruption that hangs, such as a turn owner stuck in its
+    cancellation cleanup, must not hold the switch past the settle window, and
+    a switch that leaves early must not reopen admission between releasing turn
+    owners and tearing down the runtime they ran on."""
     controller, coordinator, admissions, turns = controller_fixture(busy=True)
-    coordinator._drain_timeout = 1
-    ready = asyncio.Event()
+    releasing, released = asyncio.Event(), asyncio.Event()
 
-    async def transaction():
+    async def release(**_kw):
+        releasing.set()
+        await released.wait()
+        return 0
+
+    controller.session_turns.release_for_backend_refresh.side_effect = release
+
+    async def switch():
         async with coordinator.migration_guard(("codex",)):
-            ready.set()
-    task = asyncio.create_task(transaction())
-    while not admissions:
+            pytest.fail("mutation admitted over an unfinished interruption")
+
+    task = asyncio.create_task(switch())
+    try:
+        await releasing.wait()
+        if leaves == "cancelled":
+            task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert done, "the switch is still waiting on the interruption"
+        if leaves == "cancelled":
+            assert task.cancelled()
+        else:
+            with pytest.raises(NativeMigrationBlockedError, match="native_runtime_busy"):
+                task.result()
+        assert admissions == turns == {"codex"}
+        # The credential lease stays with the teardown, so no native login or
+        # config writer starts beside it, and a retry refuses at once.
+        with pytest.raises(NativeMigrationBlockedError, match="native_auth_in_progress"):
+            NativeCredentialLease(("codex",)).acquire()
+        with pytest.raises(NativeMigrationBlockedError, match="backend_restart_in_progress"):
+            async with coordinator.migration_guard(("codex",)):
+                pytest.fail("a retry entered beside an unfinished teardown")
+    finally:
+        released.set()
+    await coordinator.wait("codex")
+    for _ in range(50):
+        if not admissions:
+            break
         await asyncio.sleep(0)
-    assert not ready.is_set()
-    controller.agent_service.backend_runtime_active.return_value = False
-    await task
-    assert ready.is_set()
-    assert not admissions and not turns
+    controller.agent_service.force_cancel_backend_turns.assert_awaited_once_with("codex")
+    coordinator._refresh.assert_awaited_once_with("codex", True)
+    controller.agent_service.agents["codex"].retire_for_native_migration.assert_not_awaited()
+    assert admissions == turns == set()
+    with NativeCredentialLease(("codex",)):
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,code", [
+    ("survives", "native_runtime_busy"),
+    ("teardown", "native_retirement_failed"),
+])
+async def test_guard_fails_closed_when_interruption_does_not_settle(failure, code):
+    controller, coordinator, admissions, turns = controller_fixture(busy=True)
+    if failure == "teardown":
+        coordinator._refresh.side_effect = RuntimeError("stop failed")
+    with pytest.raises(NativeMigrationBlockedError, match=code):
+        async with coordinator.migration_guard(("codex",)):
+            pytest.fail("mutation admitted over live work")
+    coordinator._refresh.assert_awaited_once_with("codex", True)
+    controller.agent_service.agents["codex"].retire_for_native_migration.assert_not_awaited()
+    assert admissions == turns == set()
+    # Deferred turns resume only on a runtime that was actually refreshed.
+    controller.session_turns.end_backend_drain.assert_awaited_once_with(
+        "codex", resume_deferred=failure != "teardown",
+    )
+
+
+@pytest.mark.asyncio
+async def test_handoff_reopens_each_backend_when_its_own_teardown_settles():
+    """MH-MIG-009: after a grouped migration leaves early, a backend whose
+    teardown settled reopens at once rather than waiting on a sibling that is
+    stuck; the shared credential lease stays held until both have settled."""
+    controller, coordinator, admissions, turns = controller_fixture(busy=True)
+    gates = {"claude": asyncio.Event(), "codex": asyncio.Event()}
+
+    async def release(*, backend, **_kw):
+        await gates[backend].wait()
+        return 0
+
+    controller.session_turns.release_for_backend_refresh.side_effect = release
+    with pytest.raises(NativeMigrationBlockedError, match="native_runtime_busy"):
+        async with coordinator.migration_guard(("claude", "codex")):
+            pytest.fail("mutation admitted over unfinished interruptions")
+    assert admissions == turns == {"claude", "codex"}
+    try:
+        gates["claude"].set()
+        await coordinator.wait("claude")
+        for _ in range(50):
+            if "claude" not in admissions:
+                break
+            await asyncio.sleep(0)
+        assert admissions == turns == {"codex"}
+        with pytest.raises(NativeMigrationBlockedError, match="native_auth_in_progress"):
+            NativeCredentialLease(("claude",)).acquire()
+    finally:
+        gates["codex"].set()
+    await coordinator.wait("codex")
+    for _ in range(50):
+        if not admissions:
+            break
+        await asyncio.sleep(0)
+    assert admissions == turns == set()
+    with NativeCredentialLease(("claude", "codex")):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_successful_retry_supersedes_a_failed_forced_restart_receipt():
+    """MH-MIG-009: a forced restart that fails after stopping the runtime leaves a
+    failed receipt. A retry that finds the backend idle and retires it must clear
+    that receipt, or the switched backend keeps reporting itself not ready."""
+    controller, coordinator, _, _ = controller_fixture(busy=True)
+
+    def teardown(backend, forced):
+        controller.agent_service.backend_runtime_active.return_value = False
+        raise RuntimeError("reload failed")
+
+    coordinator._refresh.side_effect = teardown
+    with pytest.raises(NativeMigrationBlockedError, match="native_retirement_failed"):
+        async with coordinator.migration_guard(("codex",)):
+            pytest.fail("mutation admitted after a failed teardown")
+    assert coordinator.snapshot("codex")["state"] == "failed"
+
+    async with coordinator.migration_guard(("codex",)):
+        pass
+    assert coordinator.snapshot("codex") == {"state": "applied"}
+    coordinator._refresh.assert_awaited_once_with("codex", True)
 
 
 @pytest.mark.asyncio
@@ -215,6 +359,11 @@ async def test_failed_retirement_or_external_process_never_yields(failure):
         async with coordinator.migration_guard(("codex",)):
             pytest.fail("unsafe migration admission")
     assert not admissions and not turns
+    # MH-MIG-009: a strict retirement that failed part-way leaves no runtime
+    # that deferred turns could safely resume on.
+    controller.session_turns.end_backend_drain.assert_awaited_once_with(
+        "codex", resume_deferred=failure != "retire_failure",
+    )
     with NativeCredentialLease(("codex",)):
         pass
 

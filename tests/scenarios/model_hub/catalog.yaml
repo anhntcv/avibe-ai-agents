@@ -55,6 +55,7 @@ capability:
     - tests/scenarios/model_hub/test_model_hub_migration_scenarios.py
     - tests/test_model_hub_persisted_migration.py
     - tests/test_native_process_inventory.py
+    - tests/test_native_takeover_lifecycle.py
     - tests/scenarios/model_hub/test_model_hub_native_oauth_scenarios.py
     - tests/scenarios/model_hub/test_model_hub_valuation_scenarios.py
     - tests/e2e/test_model_hub_guards.py
@@ -1264,6 +1265,29 @@ scenarios:
       - tests/test_model_hub_native_takeover.py::test_mode_only_adoption_never_imports_native_auth
       - tests/test_native_takeover_lifecycle.py::test_same_user_setuid_program_does_not_block_inventory
       - ui/src/components/settings/models/BackendSupplyModeCard.test.tsx
+      - ui/src/components/settings/models/SettingsModelsPage.render.test.tsx
+  - id: MH-MIG-009
+    name: Switching to the gateway or migrating interrupts running work instead of waiting for it
+    status: covered
+    kind: migration
+    layer: unit
+    test: tests/test_native_takeover_lifecycle.py::test_busy_guard_interrupts_running_work_then_retires_and_yields
+    related_tests:
+      - tests/test_native_takeover_lifecycle.py::test_guard_fails_closed_when_interruption_does_not_settle
+      - tests/test_native_takeover_lifecycle.py::test_abandoned_switch_keeps_admission_closed_until_teardown_completes
+      - tests/test_native_takeover_lifecycle.py::test_handoff_reopens_each_backend_when_its_own_teardown_settles
+      - tests/test_native_takeover_lifecycle.py::test_successful_retry_supersedes_a_failed_forced_restart_receipt
+      - tests/test_model_hub_native_takeover.py::test_mode_only_adoption_refuses_a_native_config_the_cli_cannot_parse
+      - tests/test_model_hub_native_takeover.py::test_mode_switch_refuses_an_unreadable_completed_receipt_before_interrupting
+      - tests/test_opencode_restore_polls.py::test_forced_refresh_neither_waits_on_nor_strands_a_stuck_restored_poll
+      - tests/test_agent_auth_service.py::AgentAuthServiceTests::test_opencode_agent_force_refresh_restarts_after_global_config_change
+  - id: MH-MIG-010
+    name: A refused switch to the gateway is reported where it was made and retried in place
+    status: covered
+    kind: migration
+    layer: unit
+    test: ui/src/components/settings/models/SettingsModelsPage.render.test.tsx::MH-MIG-010 reports a refused switch to the gateway on the direct-only screen
+    related_tests:
       - ui/src/components/settings/models/SettingsModelsPage.render.test.tsx
   - id: MH-TAKEOVER-001
     name: Recoverable failures walk the configured route and exhaust only at its end
