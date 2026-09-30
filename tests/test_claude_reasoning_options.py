@@ -4,6 +4,8 @@ import sys
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
@@ -65,8 +67,9 @@ def test_claude_reasoning_options_add_xhigh_and_max_for_fable_5_1() -> None:
     assert [item["value"] for item in options] == ["__default__", "low", "medium", "high", "xhigh", "max"]
 
 
-def test_claude_reasoning_options_add_xhigh_and_max_for_sonnet_5() -> None:
-    options = build_claude_reasoning_options("claude-sonnet-5")
+@pytest.mark.parametrize("model", ["claude-sonnet-5", "claude-sonnet-5-5"])
+def test_claude_reasoning_options_add_xhigh_and_max_for_sonnet_5_family(model: str) -> None:
+    options = build_claude_reasoning_options(model)
 
     assert [item["value"] for item in options] == ["__default__", "low", "medium", "high", "xhigh", "max"]
 
@@ -161,6 +164,8 @@ def test_normalize_claude_reasoning_effort_drops_invalid_efforts() -> None:
     assert normalize_claude_reasoning_effort("claude-opus-4-6", "max") == "max"
     assert normalize_claude_reasoning_effort("claude-sonnet-5", "xhigh") == "xhigh"
     assert normalize_claude_reasoning_effort("claude-sonnet-5", "max") == "max"
+    assert normalize_claude_reasoning_effort("claude-sonnet-5-5", "xhigh") == "xhigh"
+    assert normalize_claude_reasoning_effort("claude-sonnet-5-5", "max") == "max"
     assert normalize_claude_reasoning_effort("sonnet", "xhigh") == "xhigh"
     assert normalize_claude_reasoning_effort("sonnet", "max") == "max"
     assert normalize_claude_reasoning_effort("sonnet[1m]", "xhigh") == "xhigh"
@@ -182,6 +187,7 @@ def test_claude_1m_context_labels() -> None:
     assert format_claude_model_label("claude-opus-4-8") == "claude-opus-4-8 [1M]"
     assert format_claude_model_label("claude-opus-4-7") == "claude-opus-4-7 [1M]"
     assert format_claude_model_label("claude-opus-4-6") == "claude-opus-4-6 [1M]"
+    assert format_claude_model_label("claude-sonnet-5-5") == "claude-sonnet-5-5 [1M]"
     assert format_claude_model_label("claude-sonnet-5") == "claude-sonnet-5 [1M]"
     assert format_claude_model_label("claude-sonnet-4-6") == "claude-sonnet-4-6 [1M]"
     assert format_claude_model_label("claude-fable-5") == "claude-fable-5 [1M]"

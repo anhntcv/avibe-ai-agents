@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from vibe.claude_model_catalog import (
     FALLBACK_CLAUDE_MODELS,
     RETIRED_CLAUDE_MODELS,
@@ -19,9 +21,10 @@ def test_fable_5_1_is_tracked_in_catalog_and_fallback():
     assert "claude-fable-5-1" in FALLBACK_CLAUDE_MODELS
 
 
-def test_sonnet_5_is_tracked_in_catalog_and_fallback():
-    assert "claude-sonnet-5" in load_catalog_models()
-    assert "claude-sonnet-5" in FALLBACK_CLAUDE_MODELS
+@pytest.mark.parametrize("model", ["claude-sonnet-5", "claude-sonnet-5-5"])
+def test_sonnet_5_family_is_tracked_in_catalog_and_fallback(model):
+    assert model in load_catalog_models()
+    assert model in FALLBACK_CLAUDE_MODELS
 
 
 def test_opus_5_is_tracked_in_catalog_and_fallback():
@@ -34,9 +37,13 @@ def test_opus_5_5_is_tracked_in_catalog_and_fallback():
     assert "claude-opus-5-5" in FALLBACK_CLAUDE_MODELS
 
 
-def test_opus_5_5_sorts_before_opus_5_in_every_tracked_listing():
+@pytest.mark.parametrize(
+    ("newer", "older"),
+    [("claude-opus-5-5", "claude-opus-5"), ("claude-sonnet-5-5", "claude-sonnet-5")],
+)
+def test_point_five_release_sorts_before_its_predecessor_in_every_tracked_listing(newer, older):
     for listing in (load_catalog_models(), list(FALLBACK_CLAUDE_MODELS)):
-        assert listing.index("claude-opus-5-5") < listing.index("claude-opus-5")
+        assert listing.index(newer) < listing.index(older)
 
 
 def test_retired_models_leave_the_tracked_catalog_and_fallback():
@@ -89,6 +96,7 @@ def test_catalog_excludes_dated_4_6_and_later_internal_ids():
     assert "claude-fable-5-1-20260901" not in sort_catalog_models(["claude-fable-5-1-20260901"])
     assert "claude-opus-5-20260724" not in sort_catalog_models(["claude-opus-5-20260724"])
     assert "claude-opus-5-5-20260922" not in sort_catalog_models(["claude-opus-5-5-20260922"])
+    assert "claude-sonnet-5-5-20260928" not in sort_catalog_models(["claude-sonnet-5-5-20260928"])
 
 
 def test_dateless_model_ids_sort_before_matching_snapshots():
@@ -131,10 +139,11 @@ def test_bundle_inference_detects_fable_and_skips_mythos_preview(tmp_path):
     bundle = tmp_path / "cli.js"
     bundle.write_bytes(
         b'pick("claude-fable-5-1");previous="claude-fable-5";fallback="claude-opus-4-8";'
-        b'"claude-opus-5-5";"claude-opus-5";"claude-sonnet-5";"claude-opus-4-6-20251101";'
-        b'"claude-sonnet-4-6-20251114";"claude-sonnet-5-20260630";'
+        b'"claude-opus-5-5";"claude-opus-5";"claude-sonnet-5";"claude-sonnet-5-5";'
+        b'"claude-opus-4-6-20251101";"claude-sonnet-4-6-20251114";"claude-sonnet-5-20260630";'
         b'"claude-fable-5-20260609";"claude-fable-5-1-20260901";'
-        b'"claude-opus-5-20260724";"claude-opus-5-5-20260922";"claude-mythos-preview"'
+        b'"claude-opus-5-20260724";"claude-opus-5-5-20260922";"claude-sonnet-5-5-20260928";'
+        b'"claude-mythos-preview"'
     )
 
     models = infer_models_from_bundle(bundle)
@@ -145,6 +154,7 @@ def test_bundle_inference_detects_fable_and_skips_mythos_preview(tmp_path):
         "claude-opus-5-5",
         "claude-opus-5",
         "claude-opus-4-8",
+        "claude-sonnet-5-5",
         "claude-sonnet-5",
     ]
     # `claude-mythos-preview` carries no version segment and is not a publicly
@@ -159,3 +169,4 @@ def test_bundle_inference_detects_fable_and_skips_mythos_preview(tmp_path):
     assert "claude-fable-5-1-20260901" not in models
     assert "claude-opus-5-20260724" not in models
     assert "claude-opus-5-5-20260922" not in models
+    assert "claude-sonnet-5-5-20260928" not in models

@@ -35,6 +35,7 @@ CATALOG = {
     "anthropic": {
         "models": {
             "claude-opus-5": {"cost": {"input": 5, "output": 25, "cache_read": 0.5, "cache_write": 6.25}},
+            "claude-sonnet-5": {"cost": {"input": 2, "output": 10, "cache_read": 0.2, "cache_write": 2.5}},
             "claude-fable-5-1": {"cost": {"input": 10, "output": 50, "cache_read": 0.25, "cache_write": 12.5}},
             "claude-haiku-4-5": {"cost": {"input": 1, "output": 5, "cache_read": 0.1, "cache_write": 1.25}},
         }
@@ -108,6 +109,7 @@ def test_model_ids_normalize_to_the_price_table_spelling(reported, normalized):
         ("claude-fable-5-1", 10),
         ("claude-opus-5", 5),
         ("claude-opus-5-5", 5),  # not yet on models.dev: aliased to its predecessor
+        ("claude-sonnet-5-5", 2),  # likewise
         ("gpt-5.5", 5),
         ("gpt-5.6-luna", 0.2),
         ("relay-model", None),  # a relay's own name has no list price
