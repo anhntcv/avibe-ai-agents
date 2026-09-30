@@ -6,11 +6,42 @@ import { Check, Copy, GitFork, TextQuote } from 'lucide-react';
 import { Button } from '../ui/button';
 import { copyTextToClipboard } from '../../lib/utils';
 
-type SelectionState = { text: string; top: number; bottom: number; left: number };
+type SelectionRect = {
+  top: number;
+  bottom: number;
+  left: number;
+  right: number;
+  width: number;
+  height: number;
+};
+
+type SelectionState = {
+  text: string;
+  top: number;
+  bottom: number;
+  left: number;
+  first: SelectionRect;
+  last: SelectionRect;
+};
 
 const TOOLBAR_H = 36;
 const GAP = 8;
 const EDGE = 8;
+const PRESS_GRACE_MS = 700;
+// iOS keeps touch sequences that start within this padding around a selection
+// handle in its native selection gesture recognizer. Keep the web toolbar
+// outside that region so pointerup/touchend remains deliverable to the button.
+const SELECTION_HANDLE_PADDING = 44;
+const SELECTION_HANDLE_GAP = SELECTION_HANDLE_PADDING + GAP;
+
+const toSelectionRect = (rect: DOMRect | DOMRectReadOnly): SelectionRect => ({
+  top: rect.top,
+  bottom: rect.bottom,
+  left: rect.left,
+  right: rect.right,
+  width: rect.width,
+  height: rect.height,
+});
 
 // A floating toolbar that appears over a text selection inside the chat
 // transcript. "Quote" appends the (quoted) selection to the current composer
@@ -34,8 +65,15 @@ export const SelectionQuoteToolbar: React.FC<{
   const [sel, setSel] = useState<SelectionState | null>(null);
   const [copied, setCopied] = useState(false);
   const toolbarRef = useRef<HTMLDivElement>(null);
-  const activePointerId = useRef<number | null>(null);
+  const pressRef = useRef<{
+    pointerId: number;
+    button: HTMLButtonElement;
+    selectionText: string;
+    deferred: boolean;
+  } | null>(null);
+  const pressExpiryRef = useRef<number | null>(null);
   const [width, setWidth] = useState(0);
+  const [height, setHeight] = useState(TOOLBAR_H);
   // Touch (coarse pointer — phones AND tablets/iPads) is where the OS selection
   // menu coexists; it drives the stagger-positioning + the touch-only Copy.
   const [isTouch] = useState(
@@ -43,9 +81,6 @@ export const SelectionQuoteToolbar: React.FC<{
   );
 
   const recompute = useCallback(() => {
-    // The press owns this snapshot until release/cancellation. Touch selection
-    // changes can otherwise remove the button before its pointerup is delivered.
-    if (activePointerId.current !== null) return;
     const container = containerRef.current;
     if (!container) return;
     const selection = window.getSelection();
@@ -59,13 +94,43 @@ export const SelectionQuoteToolbar: React.FC<{
       setSel(null);
       return;
     }
-    const rect = range.getBoundingClientRect();
-    if (!rect.width && !rect.height) {
+    const rect = toSelectionRect(range.getBoundingClientRect());
+    const lineRects = Array.from(range.getClientRects())
+      .filter((lineRect) => lineRect.width || lineRect.height)
+      .map(toSelectionRect);
+    if (!rect.width && !rect.height && lineRects.length === 0) {
       setSel(null);
       return;
     }
-    setSel({ text, top: rect.top, bottom: rect.bottom, left: rect.left + rect.width / 2 });
+    setSel({
+      text,
+      top: rect.top,
+      bottom: rect.bottom,
+      left: rect.left + rect.width / 2,
+      first: lineRects[0] ?? rect,
+      last: lineRects[lineRects.length - 1] ?? rect,
+    });
   }, [containerRef]);
+
+  const clearPress = useCallback((recomputeDeferred = true) => {
+    const deferred = pressRef.current?.deferred ?? false;
+    if (pressExpiryRef.current !== null) {
+      window.clearTimeout(pressExpiryRef.current);
+      pressExpiryRef.current = null;
+    }
+    pressRef.current = null;
+    if (deferred && recomputeDeferred) recompute();
+  }, [recompute]);
+  const armPressExpiry = useCallback(() => {
+    const press = pressRef.current;
+    if (!press || pressExpiryRef.current !== null) return;
+    pressExpiryRef.current = window.setTimeout(() => {
+      if (pressRef.current !== press) return;
+      pressRef.current = null;
+      pressExpiryRef.current = null;
+      recompute();
+    }, PRESS_GRACE_MS);
+  }, [recompute]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -73,7 +138,25 @@ export const SelectionQuoteToolbar: React.FC<{
     let timer = 0;
     // Debounce so the toolbar appears when the selection settles, not on every
     // intermediate range while dragging the selection / handles.
+    const onPointerDown = () => {
+      // A new gesture invalidates any prior button press, including one whose
+      // terminal event was delivered outside the toolbar or not delivered at all.
+      clearPress();
+    };
     const onSelectionChange = () => {
+      const press = pressRef.current;
+      const currentText = window.getSelection()?.toString().trim() ?? '';
+      if (press && (!currentText || currentText === press.selectionText)) {
+        // Keep the rendered snapshot alive for a short time so a browser
+        // selectionchange between pointerdown and pointerup cannot cancel a
+        // valid tap. The expiry still releases missing terminal events.
+        window.clearTimeout(timer);
+        timer = 0;
+        press.deferred = true;
+        armPressExpiry();
+        return;
+      }
+      clearPress();
       window.clearTimeout(timer);
       timer = window.setTimeout(recompute, 150);
     };
@@ -81,24 +164,30 @@ export const SelectionQuoteToolbar: React.FC<{
     // at the new position once it settles. The toolbar persists as long as the
     // selection exists, so the user can scroll to move it clear of the OS menu.
     const onScroll = () => {
-      if (activePointerId.current !== null) return;
+      clearPress();
       setSel(null);
       window.clearTimeout(timer);
       timer = window.setTimeout(recompute, 150);
     };
+    document.addEventListener('pointerdown', onPointerDown, true);
     document.addEventListener('selectionchange', onSelectionChange);
     container.addEventListener('scroll', onScroll, { passive: true });
     return () => {
       window.clearTimeout(timer);
+      clearPress(false);
+      document.removeEventListener('pointerdown', onPointerDown, true);
       document.removeEventListener('selectionchange', onSelectionChange);
       container.removeEventListener('scroll', onScroll);
     };
-  }, [containerRef, recompute]);
+  }, [armPressExpiry, clearPress, containerRef, recompute]);
 
   // Measure the rendered toolbar so we can clamp it on-screen by its real width
-  // (label widths vary by locale + which actions are shown).
+  // and height (label widths vary by locale + which actions are shown).
   useLayoutEffect(() => {
-    if (sel && toolbarRef.current) setWidth(toolbarRef.current.offsetWidth);
+    if (sel && toolbarRef.current) {
+      setWidth(toolbarRef.current.offsetWidth);
+      setHeight(toolbarRef.current.offsetHeight || TOOLBAR_H);
+    }
   }, [sel, onQuote, onAskInNew, isTouch]);
 
   if (!sel) return null;
@@ -107,7 +196,7 @@ export const SelectionQuoteToolbar: React.FC<{
   if (!onQuote && !onAskInNew && !isTouch) return null;
 
   const dismiss = () => {
-    activePointerId.current = null;
+    clearPress(false);
     window.getSelection()?.removeAllRanges();
     setSel(null);
     setCopied(false);
@@ -130,67 +219,120 @@ export const SelectionQuoteToolbar: React.FC<{
     });
   };
 
-  const cancelPress = (e: React.PointerEvent) => {
-    if (activePointerId.current !== e.pointerId) return;
-    activePointerId.current = null;
-    recompute();
+  // Activate on pointerup (mouse + touch) and Enter/Space (keyboard). The
+  // pointerdown preventDefault keeps the text selection alive. We deliberately
+  // keep only a short-lived gesture match here: iOS can deliver pointerdown
+  // for a touch near a selection handle without ever delivering pointerup, so
+  // state that waits for an end event must not gate selection recomputation.
+  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    clearPress();
+    if (!e.isPrimary || e.button !== 0) return;
+    e.preventDefault();
+    pressRef.current = {
+      pointerId: e.pointerId,
+      button: e.currentTarget,
+      selectionText: sel.text,
+      deferred: false,
+    };
   };
-
-  // Capture the pointer so release/cancellation still arrives after it moves
-  // away. Release must land inside the original button to activate; scrolling
-  // the toolbar can cancel the gesture without accidentally quoting or forking.
-  // preventDefault avoids a mouse press moving focus/selection. It does not
-  // replace the explicit snapshot lifetime above.
-  const pressHandlers = {
-    onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
-      if (!e.isPrimary || e.button !== 0 || activePointerId.current !== null) return;
-      e.preventDefault();
-      activePointerId.current = e.pointerId;
-      e.currentTarget.setPointerCapture(e.pointerId);
-    },
-    onPointerCancel: cancelPress,
-    onLostPointerCapture: cancelPress,
-  };
-  const releasePress = (e: React.PointerEvent<HTMLButtonElement>, run: () => void) => {
-    if (activePointerId.current !== e.pointerId) return;
-    activePointerId.current = null;
+  const handlePointerUp = (e: React.PointerEvent<HTMLButtonElement>, run: () => void) => {
+    const press = pressRef.current;
+    const mismatch = (
+      !press
+      || !e.isPrimary
+      || e.button !== 0
+      || press.pointerId !== e.pointerId
+      || press.button !== e.currentTarget
+    );
     const rect = e.currentTarget.getBoundingClientRect();
-    if (e.clientX >= rect.left && e.clientX <= rect.right
-      && e.clientY >= rect.top && e.clientY <= rect.bottom) {
-      run();
+    const releasedInside = (
+      !mismatch
+      && e.clientX >= rect.left
+      && e.clientX <= rect.right
+      && e.clientY >= rect.top
+      && e.clientY <= rect.bottom
+    );
+    clearPress(!releasedInside);
+    if (!releasedInside) {
+      return;
     }
-    recompute();
+    run();
   };
-  const activateWithKey = (e: React.KeyboardEvent, run: () => void) => {
+  const handleKeyDown = (e: React.KeyboardEvent, run: () => void) => {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
       run();
     }
   };
 
-  const roomAbove = sel.top > TOOLBAR_H + GAP + EDGE;
-  const roomBelow = window.innerHeight - sel.bottom > TOOLBAR_H + GAP + EDGE;
-  let below: boolean;
-  if (isTouch) {
-    // The OS selection menu can't be queried or suppressed, but it sits toward
-    // screen center: BELOW a selection in the top half, ABOVE one in the bottom
-    // half. Stagger ours toward the nearer edge (the opposite side) so the two
-    // don't overlap. Fall back if that edge is clipped.
-    below = (sel.top + sel.bottom) / 2 >= window.innerHeight / 2;
-    if (below && !roomBelow) below = false;
-    else if (!below && !roomAbove) below = true;
-  } else {
-    // Desktop has no OS selection menu — just prefer above, flip if no room.
-    below = !roomAbove;
-  }
-  const rawTop = below ? sel.bottom + GAP : sel.top - TOOLBAR_H - GAP;
-  // Keep the toolbar on-screen vertically too, so it stays visible (and the
-  // user can still act) when the selection is scrolled near a viewport edge.
-  const top = Math.min(Math.max(rawTop, EDGE), window.innerHeight - TOOLBAR_H - EDGE);
+  const toolbarHeight = height || TOOLBAR_H;
+  const placementGap = isTouch ? SELECTION_HANDLE_GAP : GAP;
+  const topEdge = EDGE;
+  const bottomEdge = Math.max(EDGE, window.innerHeight - toolbarHeight - EDGE);
+  const clampTop = (rawTop: number) => Math.min(Math.max(rawTop, topEdge), bottomEdge);
+  const preferBelow = (sel.top + sel.bottom) / 2 >= window.innerHeight / 2;
+  const preferredAboveTop = clampTop(sel.first.top - toolbarHeight - placementGap);
+  const preferredBelowTop = clampTop(sel.last.bottom + placementGap);
   // Clamp by the on-screen (capped) width so a toolbar wider than the viewport
   // centers + scrolls internally instead of pushing an edge off-screen.
-  const half = Math.min(width, window.innerWidth - 2 * EDGE) / 2;
-  const left = Math.min(Math.max(sel.left, EDGE + half), window.innerWidth - EDGE - half);
+  const leftHalf = Math.min(width, window.innerWidth - 2 * EDGE) / 2;
+  const left = Math.min(
+    Math.max(sel.left, EDGE + leftHalf),
+    window.innerWidth - EDGE - leftHalf,
+  );
+
+  let top: number;
+  if (!isTouch) {
+    // Desktop has no OS selection menu — just prefer above, flip if no room.
+    top = sel.first.top >= toolbarHeight + GAP + EDGE
+      ? preferredAboveTop
+      : preferredBelowTop;
+  } else {
+    // A toolbar is safe only when its full rectangle misses both endpoint
+    // handle regions. This matters for long selections: neither the area above
+    // the first line nor the area below the last line may fit, while the
+    // middle band between those two regions still can.
+    const measuredWidth = width || Math.max(0, window.innerWidth - 2 * EDGE);
+    const measuredHalf = Math.min(measuredWidth, window.innerWidth - 2 * EDGE) / 2;
+    const toolbarLeft = left - measuredHalf;
+    const toolbarRight = left + measuredHalf;
+    const safeRects = [sel.first, sel.last].map((rect) => ({
+      top: rect.top - SELECTION_HANDLE_GAP,
+      bottom: rect.bottom + SELECTION_HANDLE_GAP,
+      left: rect.left - SELECTION_HANDLE_GAP,
+      right: rect.right + SELECTION_HANDLE_GAP,
+    }));
+    const intersectsSafeRect = (candidateTop: number) => safeRects.some((rect) => (
+      toolbarLeft < rect.right
+      && toolbarRight > rect.left
+      && candidateTop < rect.bottom
+      && candidateTop + toolbarHeight > rect.top
+    ));
+    const overlapArea = (candidateTop: number) => safeRects.reduce((total, rect) => {
+      const overlapWidth = Math.max(0, Math.min(toolbarRight, rect.right) - Math.max(toolbarLeft, rect.left));
+      const overlapHeight = Math.max(
+        0,
+        Math.min(candidateTop + toolbarHeight, rect.bottom) - Math.max(candidateTop, rect.top),
+      );
+      return total + overlapWidth * overlapHeight;
+    }, 0);
+    const middleStart = sel.first.bottom + SELECTION_HANDLE_GAP;
+    const middleEnd = sel.last.top - SELECTION_HANDLE_GAP - toolbarHeight;
+    const middleTop = middleStart <= middleEnd
+      ? clampTop((middleStart + middleEnd) / 2)
+      : null;
+    const candidates = [
+      preferBelow ? preferredBelowTop : preferredAboveTop,
+      preferBelow ? preferredAboveTop : preferredBelowTop,
+      ...(middleTop === null ? [] : [middleTop]),
+      topEdge,
+      bottomEdge,
+    ];
+    const safeCandidate = candidates.find((candidateTop) => !intersectsSafeRect(candidateTop));
+    top = safeCandidate ?? candidates.reduce((best, candidateTop) => (
+      overlapArea(candidateTop) < overlapArea(best) ? candidateTop : best
+    ));
+  }
 
   const itemClass = 'h-9 gap-1.5 rounded-none px-3 text-[13px] font-medium';
 
@@ -207,9 +349,9 @@ export const SelectionQuoteToolbar: React.FC<{
         <Button
           variant="ghost"
           className={itemClass}
-          {...pressHandlers}
-          onPointerUp={(e) => releasePress(e, runQuote)}
-          onKeyDown={(e) => activateWithKey(e, runQuote)}
+          onPointerDown={handlePointerDown}
+          onPointerUp={(e) => handlePointerUp(e, runQuote)}
+          onKeyDown={(e) => handleKeyDown(e, runQuote)}
         >
           <TextQuote className="size-3.5 text-muted" />
           {t('chat.selection.quote')}
@@ -221,9 +363,9 @@ export const SelectionQuoteToolbar: React.FC<{
           <Button
             variant="ghost"
             className={itemClass}
-            {...pressHandlers}
-            onPointerUp={(e) => releasePress(e, runAsk)}
-            onKeyDown={(e) => activateWithKey(e, runAsk)}
+            onPointerDown={handlePointerDown}
+            onPointerUp={(e) => handlePointerUp(e, runAsk)}
+            onKeyDown={(e) => handleKeyDown(e, runAsk)}
           >
             <GitFork className="size-3.5 text-muted" />
             {t('chat.selection.askInNew')}
@@ -236,9 +378,9 @@ export const SelectionQuoteToolbar: React.FC<{
           <Button
             variant="ghost"
             className={itemClass}
-            {...pressHandlers}
-            onPointerUp={(e) => releasePress(e, runCopy)}
-            onKeyDown={(e) => activateWithKey(e, runCopy)}
+            onPointerDown={handlePointerDown}
+            onPointerUp={(e) => handlePointerUp(e, runCopy)}
+            onKeyDown={(e) => handleKeyDown(e, runCopy)}
           >
             {copied ? <Check className="size-3.5 text-mint-ink" /> : <Copy className="size-3.5 text-muted" />}
             {t('chat.selection.copy')}
