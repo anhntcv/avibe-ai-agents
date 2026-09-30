@@ -5,10 +5,15 @@ Without it, a fixture that made ``pid_alive`` true for fake pids let a failed
 start roll back through the real ``stop_ui()``, which sent SIGTERM to pid 5678:
 on a CI runner that pid was the pytest process itself, and the shard died with
 exit code 143.
+
+The same guard bounds the product's process lookups. A desktop start that read
+fake pid 1234's environment through psutil was refused on the one runner where a
+root process held 1234, and passed everywhere else.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
@@ -19,13 +24,15 @@ from contextlib import suppress
 import psutil
 import pytest
 
+from core.process_isolation import process_group_exists
 from tests.conftest import _REAL_OS_KILL
+from tests.fake_pid_helpers import fake_pid
+from vibe import runtime
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the guard is POSIX-only; see tests/conftest.py")
 
 _SLEEP = [sys.executable, "-c", "import time; time.sleep(60)"]
-# Above every pid_max Linux and macOS allow, so no process can ever hold it.
-_NO_SUCH_PID = 2**22 + 1
+_NO_SUCH_PID = fake_pid()
 
 
 def _spawn_detached(
@@ -246,3 +253,48 @@ def test_signal_zero_still_probes_any_pid(stranger):
 def test_the_opt_out_marker_delivers_a_signal_the_guard_would_refuse(stranger):
     os.kill(stranger, signal.SIGTERM)
     assert _wait_until_gone(stranger)
+
+
+def _free_pid() -> int:
+    """A pid nothing holds right now, below every pid limit, so the guard is what answers."""
+
+    for pid in range(99_998, 1, -1):
+        try:
+            _REAL_OS_KILL(pid, 0)
+        except ProcessLookupError:
+            return pid
+        except PermissionError:
+            continue
+    pytest.skip("every pid below 99999 is taken")
+
+
+@pytest.mark.parametrize(
+    "lookup",
+    [
+        pytest.param(runtime.process_create_time, id="psutil.Process"),
+        pytest.param(runtime.pid_alive, id="signal-0-probe"),
+        pytest.param(lambda pid: process_group_exists(pid, logging.getLogger(__name__), "test"), id="group-probe"),
+    ],
+)
+@pytest.mark.parametrize("holder", ["a-stranger", "nothing"])
+def test_a_product_lookup_of_a_pid_the_test_did_not_start_fails_whatever_holds_it(
+    request, lookup, holder, _foreign_signal_guard
+):
+    # Failing while nothing holds the pid is what makes a fake pid fail on every
+    # machine, instead of only where a real process happens to hold it. The
+    # stranger leads its own session, so its pid names a live group too.
+    pid = request.getfixturevalue("stranger") if holder == "a-stranger" else _free_pid()
+    with pytest.raises(pytest.fail.Exception, match="neither started nor found by listing"):
+        lookup(pid)
+    _foreign_signal_guard.violations.clear()
+
+
+def test_a_fake_pid_names_no_process_on_any_machine(_foreign_signal_guard):
+    pid = fake_pid()
+
+    assert runtime.process_create_time(pid) is None
+    assert runtime.pid_alive(pid) is False
+    assert process_group_exists(pid, logging.getLogger(__name__), "test") is False
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    assert _foreign_signal_guard.violations == []

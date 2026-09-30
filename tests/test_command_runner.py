@@ -16,6 +16,7 @@ from core.command_runner import (
     SupervisedCommandStartupError,
     run_supervised_command,
 )
+from tests.fake_pid_helpers import fake_pid
 
 
 class _FakeStdin:
@@ -45,7 +46,8 @@ class _FakeProcess:
         stdin: _FakeStdin | None = None,
         stderr: bytes = b"",
     ) -> None:
-        self.pid = 1234
+        # A supervisor that never ran: its pid stands for no process.
+        self.pid = fake_pid()
         self.returncode = 0
         self.stdin = stdin or _FakeStdin()
         self.stderr = stderr

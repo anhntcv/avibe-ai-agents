@@ -63,6 +63,8 @@ import psutil
 import pytest
 from sqlalchemy.exc import SAWarning
 
+from tests.fake_pid_helpers import PID_LIMIT
+
 REAL_USER_HOME = Path.home()
 _SQLITE_DEFAULT_STATE_MODULES: dict[Path, bool] = {}
 
@@ -376,8 +378,13 @@ _REAL_OS_GETPGID = getattr(os, "getpgid", None)
 _REAL_OS_GETSID = getattr(os, "getsid", None)
 _REAL_OS_GETPGRP = getattr(os, "getpgrp", None)
 _REAL_PSUTIL_PROCESS = psutil.Process
+_REAL_PSUTIL_PROCESS_INIT = psutil.Process.__init__
 _REAL_PSUTIL_PIDS = psutil.pids
 _REAL_POPEN_INIT = subprocess.Popen.__init__
+
+# The packages the wheel ships: a process lookup made from one of them is the
+# product's, and that is where a test's fake pid must not reach the real table.
+_PRODUCT_PACKAGES = frozenset({"vibe", "config", "core", "modules", "storage"})
 
 
 def _describe_pid(pid: int) -> str:
@@ -410,6 +417,19 @@ class _ForeignSignalGuard:
     gets the ESRCH the real call would raise, delivered to nothing, because a
     descendant the test collected may exit before it is signalled. Signal 0 is
     a liveness probe and passes.
+
+    The same record bounds what the product may look up. A ``psutil.Process``,
+    or a signal-0 probe of a pid or a group, made from the product's packages
+    must name this pytest process, a process the test owns, one psutil listed
+    during the test, or a pid no process can hold: for any other pid the answer depends on which
+    process, if any, holds it on the machine running the test, which is how a
+    fake pid such as 1234 turned into a refusal on the one CI runner where a
+    real process held it. With nothing holding the pid the lookup fails at
+    once, so such a test fails everywhere instead; the pids
+    ``tests.fake_pid_helpers.fake_pid`` hands out are the ones that stand for
+    no process. A listing makes every pid it saw fair, so a fake pid that
+    collides with one the test listed earlier still slips through; that test
+    has failed on every machine where the pid was free.
     """
 
     def __init__(self, test_temp: Path) -> None:
@@ -417,6 +437,8 @@ class _ForeignSignalGuard:
         # The whole final component: `test_x1` must not claim `test_x10`.
         self.names_test_temp = re.compile(re.escape(str(test_temp)) + r"(?![\w.-])").search
         self.owned: set[int] = set()
+        # Every pid psutil listed while this test ran: a scan finds real processes by design.
+        self.listed: set[int] = set()
         self.violations: list[str] = []
 
     def _owns(self, pid: int) -> bool:
@@ -521,15 +543,39 @@ class _ForeignSignalGuard:
         # cannot swallow it; the teardown check covers anything broader.
         pytest.fail(message)
 
+    def refuse_unknown_lookup(self, lookup: str, pid: int, caller) -> None:
+        """Fail the test when the product's ``lookup`` of ``pid`` would read whatever the machine holds there."""
+
+        __tracebackhide__ = True
+        if pid == self.me or pid >= PID_LIMIT or pid in self.listed or self._owns(pid):
+            return
+        message = (
+            f"{caller.f_globals.get('__name__')}.{caller.f_code.co_name} looked up pid "
+            f"{_describe_pid(pid)} through {lookup}, a pid this test neither started nor found "
+            "by listing processes, so what the product reads depends on which process, if any, "
+            "holds that pid on the machine running the test. Use "
+            "tests.fake_pid_helpers.fake_pid() for a pid that stands for no process, or start a "
+            "real process when the product must read its identity."
+        )
+        self.violations.append(message)
+        pytest.fail(message)
+
 
 # The running test's guard, or None between tests and in opted-out tests.
 _active_signal_guard: _ForeignSignalGuard | None = None
+
+
+def _called_from_product(caller) -> bool:
+    return caller.f_globals.get("__name__", "").partition(".")[0] in _PRODUCT_PACKAGES
 
 
 def _guarded_kill(pid, sig):
     __tracebackhide__ = True
     guard = _active_signal_guard
     if guard is not None:
+        caller = sys._getframe(1)
+        if sig == 0 and isinstance(pid, int) and pid > 0 and _called_from_product(caller):
+            guard.refuse_unknown_lookup("os.kill(pid, 0)", pid, caller)
         guard.refuse_foreign("kill", pid, sig, pid)
     return _REAL_OS_KILL(pid, sig)
 
@@ -538,6 +584,10 @@ def _guarded_killpg(pgid, sig):
     __tracebackhide__ = True
     guard = _active_signal_guard
     if guard is not None:
+        caller = sys._getframe(1)
+        # A group is named by its leader's pid.
+        if sig == 0 and isinstance(pgid, int) and pgid > 0 and _called_from_product(caller):
+            guard.refuse_unknown_lookup("os.killpg(pgid, 0)", pgid, caller)
         # libc's killpg(pgid) is kill(-pgid): on macOS a negative pgid names one pid.
         guard.refuse_foreign("killpg", pgid, sig, -pgid if isinstance(pgid, int) else pgid)
     return _REAL_OS_KILLPG(pgid, sig)
@@ -551,6 +601,30 @@ def _recording_popen_init(popen, *args, **kwargs):
         guard.owned.add(popen.pid)
 
 
+@wraps(_REAL_PSUTIL_PROCESS_INIT)
+def _guarded_process_init(process, pid=None):
+    __tracebackhide__ = True
+    guard = _active_signal_guard
+    caller = sys._getframe(1)
+    # The guard reads the real table through this same constructor.
+    if guard is not None and caller.f_globals is not globals() and isinstance(pid, int) and pid > 0:
+        if caller.f_globals.get("__name__", "").partition(".")[0] == "psutil":
+            # What psutil constructs itself it has listed: process_iter, children(), parents().
+            guard.listed.add(pid)
+        elif _called_from_product(caller):
+            guard.refuse_unknown_lookup("psutil.Process", pid, caller)
+    _REAL_PSUTIL_PROCESS_INIT(process, pid)
+
+
+@wraps(_REAL_PSUTIL_PIDS)
+def _listing_pids():
+    pids = _REAL_PSUTIL_PIDS()
+    guard = _active_signal_guard
+    if guard is not None:
+        guard.listed.update(pids)
+    return pids
+
+
 # Installed once for the whole run rather than per test through `monkeypatch`:
 # a test's own `monkeypatch.undo()` would otherwise remove the guard mid-test.
 # psutil's `send_signal`/`terminate`/`kill` and `subprocess.Popen`'s all end in
@@ -558,12 +632,16 @@ def _recording_popen_init(popen, *args, **kwargs):
 # on Windows `os.kill` is TerminateProcess (and signal 0 is CTRL_C_EVENT, not a
 # probe), `os.killpg` does not exist, and the product's Windows stop path calls
 # TerminateProcess through ctypes, so wrapping `os.kill` there would guard
-# nothing the product reaches.
+# nothing the product reaches. Every psutil lookup constructs a `Process`, and
+# `process_iter` lists through the module's `pids`; a test that replaces
+# `psutil.Process` with its own fake bypasses both, as it means to.
 _SIGNAL_GUARD_SUPPORTED = os.name != "nt" and _REAL_OS_KILLPG is not None
 if _SIGNAL_GUARD_SUPPORTED:
     os.kill = _guarded_kill
     os.killpg = _guarded_killpg
     subprocess.Popen.__init__ = _recording_popen_init
+    psutil.Process.__init__ = _guarded_process_init
+    psutil.pids = _listing_pids
 
 
 @pytest.fixture(autouse=True)
@@ -575,6 +653,11 @@ def _foreign_signal_guard(request, tmp_path):
     pid -- on a CI runner that was the pytest process itself, on a developer
     machine it can be the live Avibe service. Processes a test starts stay
     signalable; ``allow_foreign_signals(reason=...)`` opts a test out.
+
+    A fake pid the product only reads is as machine-dependent: a desktop start
+    that asked psutil for pid 1234's environment was refused on the one runner
+    where a root process held 1234. So the product's lookups are bounded the
+    same way.
     """
 
     global _active_signal_guard
@@ -595,7 +678,7 @@ def _foreign_signal_guard(request, tmp_path):
         _active_signal_guard = None
     __tracebackhide__ = True
     if guard.violations:
-        pytest.fail("signals to processes this test did not start were blocked:\n" + "\n".join(guard.violations))
+        pytest.fail("signals and lookups this test may not make were blocked:\n" + "\n".join(guard.violations))
 
 
 @pytest.fixture
