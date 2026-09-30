@@ -52,7 +52,7 @@ from vibe.model_hub_runtime import client as client_module
 from vibe.model_hub_runtime import installer as runtime_installer_module
 from vibe.model_hub_runtime import supervisor as supervisor_module
 from vibe.model_hub_runtime.adapter import CLIProxyEngineAdapter
-from vibe.model_hub_runtime.api_key_vendors import api_key_vendor_catalog
+from vibe.model_hub_runtime.api_key_vendors import api_key_vendor_catalog, official_models_dev_provider
 from vibe.model_hub_runtime.client import EngineClient, EngineClientError, EngineConnection
 from vibe.model_hub_runtime.config import write_engine_config
 from vibe.model_hub_runtime.environment import engine_subprocess_environment
@@ -1653,6 +1653,155 @@ def test_config_generation_is_private_and_never_logs_secrets(
         store.prepare_instance("install-1")
 
 
+def test_engine_config_declares_text_only_input_only_on_openai_compatibility_models(
+    tmp_path: Path,
+) -> None:
+    """MH-MODALITIES-001: CPA replaces tool-result images only for a declared text-only openai-compatibility model."""
+
+    store = EngineStateStore(tmp_path / "state")
+    instance_dir, runtime_secrets = store.prepare_instance("install-1")
+    chat_ref = store.store_api_key("chat-secret", base_url="https://api.example.test/v1")
+    responses_ref = store.store_api_key("responses-secret", vendor="openai", protocol="openai_responses")
+    anthropic_ref = store.store_api_key("anthropic-secret", vendor="anthropic", protocol="anthropic")
+    store.sync_sources(
+        [
+            _binding(
+                chat_ref,
+                model_ids=("text-model", "unknown-model"),
+                route_model_ids=("routed-text-model",),
+                text_only_model_ids=("text-model", "routed-text-model"),
+            ),
+            *(
+                _binding(
+                    credential_ref,
+                    source_id=source_id,
+                    vendor=vendor,
+                    protocol=protocol,
+                    base_url=None,
+                    model_ids=("text-model",),
+                    text_only_model_ids=("text-model",),
+                )
+                for credential_ref, source_id, vendor, protocol in (
+                    (responses_ref, "src_responses1", "openai", "openai_responses"),
+                    (anthropic_ref, "src_anthropic1", "anthropic", "anthropic"),
+                )
+            ),
+        ]
+    )
+    config_path = instance_dir / "config.yaml"
+
+    write_engine_config(
+        config_path,
+        host="127.0.0.1",
+        port=18231,
+        auth_dir=store.auth_dir,
+        runtime_secrets=runtime_secrets,
+        sources=store.list_sources(),
+        state_store=store,
+    )
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    # CPA matches a request to an entry by name, then by alias; both are the
+    # routed ID, so either lookup reaches the entry that carries the key.
+    assert payload["openai-compatibility"][0]["models"] == [
+        {"name": "text-model", "alias": "text-model", "display-name": "text-model #0", "input-modalities": ["text"]},
+        {"name": "unknown-model", "alias": "unknown-model", "display-name": "unknown-model #0"},
+        {
+            "name": "routed-text-model",
+            "alias": "routed-text-model",
+            "display-name": "routed-text-model #0",
+            "input-modalities": ["text"],
+        },
+    ]
+    for key in ("codex-api-key", "claude-api-key"):
+        [entry] = payload[key]
+        assert entry["models"] == [
+            {"name": "text-model", "alias": "text-model", "display-name": "text-model #0"}
+        ]
+
+
+def _rendered_text_only(tmp_path: Path, model_ids: tuple[str, ...], text_only: tuple[str, ...]) -> set[str]:
+    store = EngineStateStore(tmp_path / "state")
+    instance_dir, runtime_secrets = store.prepare_instance("install-1")
+    chat_ref = store.store_api_key("chat-secret", base_url="https://api.example.test/v1")
+    store.sync_sources([_binding(chat_ref, model_ids=model_ids, text_only_model_ids=text_only)])
+    config_path = instance_dir / "config.yaml"
+    write_engine_config(
+        config_path,
+        host="127.0.0.1",
+        port=18231,
+        auth_dir=store.auth_dir,
+        runtime_secrets=runtime_secrets,
+        sources=store.list_sources(),
+        state_store=store,
+    )
+    [compat] = yaml.safe_load(config_path.read_text(encoding="utf-8"))["openai-compatibility"]
+    return {model["name"] for model in compat["models"] if model.get("input-modalities") == ["text"]}
+
+
+def test_engine_config_declares_models_the_engine_cannot_tell_apart_together_or_not_at_all(tmp_path: Path) -> None:
+    """MH-MODALITIES-001: CPA's lookup folds case and drops a (...) suffix, so such a group is marked whole or not at all."""
+
+    assert _rendered_text_only(
+        tmp_path,
+        ("target", "TARGET", "other", "other(high)", "solo"),
+        ("target", "other", "other(high)", "solo"),
+    ) == {"other", "other(high)", "solo"}
+
+
+@pytest.mark.parametrize("seed", range(50))
+def test_engine_config_never_declares_a_model_the_engine_could_confuse_with_an_unmarked_one(tmp_path: Path, seed: int) -> None:
+    """MH-MODALITIES-001: every rendered mark was asked for, and no unmarked model shares its engine name."""
+
+    import random
+
+    rng = random.Random(seed)
+    spellings = ["target", "Target", "TARGET", "target(high)", "Target (low)", "other", "OTHER(x)", "solo"]
+    model_ids = tuple(rng.sample(spellings, rng.randrange(1, len(spellings) + 1)))
+    text_only = tuple(model for model in model_ids if rng.random() < 0.7)
+
+    def engine_name(model: str) -> str:
+        # Written out from CLIProxyAPI v7.3.16's normalizeOpenAICompatibilityModelName.
+        name = model.strip()
+        if "(" in name and name.endswith(")"):
+            name = name[: name.rindex("(")]
+        return name.strip().lower()
+
+    rendered = _rendered_text_only(tmp_path / str(seed), model_ids, text_only)
+
+    assert rendered <= set(text_only)
+    unmarked_names = {engine_name(model) for model in model_ids if model not in rendered}
+    assert not {engine_name(model) for model in rendered} & unmarked_names
+    # Nothing is withheld that the guard does not require.
+    assert {model for model in text_only if engine_name(model) not in {
+        engine_name(other) for other in model_ids if other not in text_only
+    }} == rendered
+
+
+def test_engine_record_reads_an_unreadable_text_only_list_as_undeclared(caplog: pytest.LogCaptureFixture) -> None:
+    """Undeclared is the engine default, so a shape this release cannot read degrades to it, with a warning."""
+
+    record = SourceRecord.from_payload(
+        {
+            "source_id": "src_fixture123",
+            "vendor": "custom",
+            "protocol": "openai_chat",
+            "base_url": "https://api.example.test/v1",
+            "credential_ref": "cred_fixture123",
+            "model_ids": ["text-model"],
+            "prefix": "avibe-fixture",
+            "model_reasoning_efforts": [],
+            "text_only_model_ids": {"text-model": ["text"]},
+        }
+    )
+
+    assert record.model_ids == ("text-model",)
+    assert record.text_only_model_ids == ()
+    assert any(
+        record.levelname == "WARNING" and "src_fixture123" in record.getMessage() for record in caplog.records
+    )
+
+
 def test_mixed_anthropic_credentials_disable_cloak_only_for_api_key_entry(
     tmp_path: Path,
 ) -> None:
@@ -2083,6 +2232,35 @@ def test_catalog_official_base_url_composes_one_probe_endpoint(
         if segment.startswith("v") and segment[1:2].isdigit()
     ]
     assert len(versions) == 1, composed
+
+
+@pytest.mark.parametrize(
+    ("vendor", "base_url", "provider"),
+    [
+        ("deepseek", None, "deepseek"),
+        ("deepseek", "https://api.deepseek.com", "deepseek"),
+        # The engine calls one endpoint for each of these spellings.
+        ("deepseek", "https://api.deepseek.com/v1", "deepseek"),
+        ("deepseek", "https://API.DeepSeek.com/", "deepseek"),
+        ("deepseek", "https://api.deepseek.com:443/v1/", "deepseek"),
+        ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1/", "alibaba-cn"),
+        # Any other endpoint may front another deployment.
+        ("deepseek", "https://api.deepseek.com/beta", None),
+        ("deepseek", "http://api.deepseek.com", None),
+        ("deepseek", "https://api.deepseek.com:8443", None),
+        # A stored port no connection can use names no official endpoint.
+        ("deepseek", "https://api.deepseek.com:bad/v1", None),
+        ("deepseek", "https://api.deepseek.com:99999/v1", None),
+        ("deepseek", "https://relay.example/v1", None),
+        ("qwen", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", None),
+        ("custom", None, None),
+        ("openai", None, None),
+    ],
+)
+def test_only_a_vendors_official_endpoint_is_described_by_its_models_dev_provider(vendor, base_url, provider) -> None:
+    """MH-MODALITIES-002: the vendor's models.dev entries describe the endpoint the engine calls, in any spelling."""
+
+    assert official_models_dev_provider(vendor, base_url) == provider
 
 
 @pytest.mark.parametrize(

@@ -19,6 +19,7 @@ from config.v2_config import (
     normalize_storable_backend_model_text,
 )
 from core.handlers.model_hub.catalog_admission import admissible_backend_model
+from core.handlers.model_hub.identifiers import normalized_model_id
 
 
 logger = logging.getLogger(__name__)
@@ -275,6 +276,20 @@ def load_models_dev_catalog_with_date() -> tuple[dict[str, Any], float | None, b
             _refresh_in_background()
         return catalog, fetched, False
     return {}, None, _refresh_in_background()
+
+
+def cached_models_dev_catalog() -> dict[str, Any]:
+    """The cached copy as it stands, stale or not, and never a fetch.
+
+    For readers that must not start or wait on network I/O, such as an engine
+    sync. The foreground loader holds ``_CACHE_LOCK`` across its fetch, and the
+    copy is replaced atomically, so this read takes no lock. The readers above
+    keep the copy fresh.
+    """
+
+    cached = _read_cache()
+    catalog = _catalog_from_cache(cached) if cached.get("url") == _models_dev_url() else None
+    return catalog or {}
 
 
 def _search_tokens(query: str) -> tuple[str, ...]:
@@ -577,3 +592,57 @@ def exact_models_dev_matches(
             vendor_map,
         )
     return matches
+
+
+def text_only_model_ids(
+    provider_id: str,
+    model_ids: Iterable[str],
+    catalog: dict[str, Any],
+) -> set[str]:
+    """The ids one models.dev provider's own entries declare text-only.
+
+    A provider's entry describes what its upstream accepts; a copy under any
+    other provider describes a different deployment and is not read. An id
+    matches an entry whose key or ``id`` is the same model identity: trimmed,
+    case preserved. It is text-only when every entry it matches has a
+    ``modalities.input`` that is a non-empty list of strings which, compared
+    as the engine compares them, contains ``text`` and not ``image``. A
+    provider whose models cannot be read declares nothing, and says so.
+    """
+
+    provider = catalog.get(provider_id)
+    if provider is None:
+        if catalog:
+            logger.warning(
+                "models.dev has no provider %s; none of its models is declared text-only", provider_id
+            )
+        return set()
+    models = provider.get("models") if isinstance(provider, dict) else None
+    if not isinstance(models, dict):
+        logger.warning(
+            "models.dev provider %s has no readable models map; none of its models is declared text-only",
+            provider_id,
+        )
+        return set()
+
+    def declares_text_only(declared: object) -> bool:
+        if not isinstance(declared, list) or not declared or not all(
+            isinstance(value, str) for value in declared
+        ):
+            return False
+        values = {value.strip().lower() for value in declared}
+        return "text" in values and "image" not in values
+
+    wanted: dict[str, list[str]] = {}
+    for model_id in dict.fromkeys(model_ids):
+        wanted.setdefault(normalized_model_id(model_id), []).append(model_id)
+    text_only: dict[str, bool] = {}
+    for model_key, model in models.items():
+        names = {normalized_model_id(str(model_key))}
+        if isinstance(model, dict) and isinstance(model.get("id"), str):
+            names.add(normalized_model_id(model["id"]))
+        modalities = model.get("modalities") if isinstance(model, dict) else None
+        verdict = declares_text_only(modalities.get("input") if isinstance(modalities, dict) else None)
+        for requested in {requested for name in names for requested in wanted.get(name, ())}:
+            text_only[requested] = text_only.get(requested, True) and verdict
+    return {requested for requested, verdict in text_only.items() if verdict}

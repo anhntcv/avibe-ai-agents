@@ -209,6 +209,55 @@ def _cached_models_dev_catalog() -> Mapping[str, Any]:
     return load_models_dev_catalog_with_date()[0]
 
 
+def _with_text_only_models(
+    bindings: list[SourceBinding],
+) -> list[SourceBinding]:
+    """Mark each bound model that its upstream's own models.dev entry declares text-only.
+
+    Only an ``openai_chat`` Source on its vendor's official endpoint has such
+    an entry: the vendor's mapped provider describes what that endpoint
+    accepts. Read at sync rather than in ``_bindings``: the cached copy
+    changes on its own, and a mutation compares the bindings it builds before
+    and after itself. The sync never fetches, and an unreadable copy leaves
+    every model undeclared, which is the engine's default.
+    """
+
+    from vibe.model_hub_runtime.api_key_vendors import official_models_dev_provider
+    from vibe.models_dev_catalog import cached_models_dev_catalog, text_only_model_ids
+
+    try:
+        providers = {
+            binding.source_id: official_models_dev_provider(binding.vendor, binding.base_url)
+            for binding in bindings
+            if binding.protocol == "openai_chat"
+        }
+        model_ids: dict[str, list[str]] = {}
+        for binding in bindings:
+            provider = providers.get(binding.source_id)
+            if provider is not None:
+                model_ids.setdefault(provider, []).extend((*binding.model_ids, *binding.route_model_ids))
+        if not model_ids:
+            return bindings
+        catalog = cached_models_dev_catalog()
+        text_only = {
+            provider: text_only_model_ids(provider, ids, catalog) for provider, ids in model_ids.items()
+        }
+    except Exception as exc:  # noqa: BLE001 - optional metadata never fails a sync
+        logger.info("Model Hub engine models have no models.dev modalities: %s", type(exc).__name__)
+        return bindings
+    return [
+        replace(
+            binding,
+            text_only_model_ids=tuple(
+                model
+                for model in dict.fromkeys((*binding.model_ids, *binding.route_model_ids))
+                if model in text_only.get(providers.get(binding.source_id) or "", ())
+            ),
+        )
+        for binding in bindings
+    ]
+
+
 _MODELS_DEV_CANDIDATE_FIELDS = (
     "models_dev_id",
     "context_window",
@@ -1470,6 +1519,8 @@ class ModelHubService:
         if not bindings and not force_empty and not has_hub_sources:
             self._engine_preparation_failed = False
             return
+        # Reading the catalog copy takes tens of milliseconds; keep it off the loop.
+        bindings = await asyncio.to_thread(_with_text_only_models, bindings)
         await self._engine_call(self.adapter.sync_sources(bindings))
         self._engine_preparation_failed = False
 
@@ -7051,6 +7102,10 @@ class ModelHubService:
                 updated.enabled = True
                 updated.runtime_default_applied = True
                 self._save_projection_neutral(previous, updated)
+                # A start renders the persisted projection, whose text-only
+                # marks come from the catalog copy of its last sync. Syncing
+                # here gives an explicit start the current copy's marks.
+                self._engine_synced = False
             await self._prepare_engine_for_demand()
             status = await self._engine_call(self.adapter.start())
             return _runtime_payload(status, enabled=True)

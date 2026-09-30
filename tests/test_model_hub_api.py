@@ -8,6 +8,7 @@ import io
 import json
 import re
 import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -4997,6 +4998,106 @@ def test_public_mutations_sync_the_engine_only_when_bindings_change(tmp_path, mu
         assert len(adapter.synced) == 1
         assert synced_projection({binding.source_id: binding for binding in adapter.synced[0]})
     assert service._engine_synced is True
+
+
+def _vendor_route_fixture(store: MemoryStore, model_id: str) -> None:
+    """One route over three openai_chat Sources: DeepSeek official, DeepSeek via a relay URL, and custom."""
+
+    _set_claude_route_fixture(store, ("src_official01", "src_relayurl01", "src_custom0001"), model_id)
+    for source, (vendor, base_url) in zip(store.config.sources, (
+        ("deepseek", None),
+        ("deepseek", "https://relay.example/v1"),
+        ("custom", "https://api.example.test/v1"),
+    )):
+        source.vendor, source.protocol, source.base_url = vendor, "openai_chat", base_url
+
+
+def _cache_models_dev(provider_models: dict) -> None:
+    from vibe import models_dev_catalog
+
+    models_dev_catalog._write_cache({
+        "url": models_dev_catalog.DEFAULT_MODELS_DEV_URL,
+        # A day-old copy is still the copy a sync reads; only its own readers refresh it.
+        "fetched_at": 0,
+        "catalog": {name: {"models": models} for name, models in provider_models.items()},
+    })
+
+
+def test_engine_sync_marks_models_their_official_upstream_declares_text_only(tmp_path, monkeypatch):
+    """MH-MODALITIES-002: only a Source on its vendor's official endpoint is marked, from that vendor's own entry."""
+
+    from vibe import models_dev_catalog
+
+    refreshes = []
+    monkeypatch.setattr(models_dev_catalog, "_refresh_in_background", lambda: refreshes.append(True))
+    _cache_models_dev({
+        "deepseek": {
+            _PROJECTION_MODEL: {"modalities": {"input": ["text"]}},
+            "vision-model": {"modalities": {"input": ["text", "image"]}},
+        },
+        # A relay's copy says nothing about DeepSeek's endpoint.
+        "relay": {"routed-text-model": {"modalities": {"input": ["text"]}}},
+    })
+    service, store, adapter = _service(tmp_path)
+    _vendor_route_fixture(store, _PROJECTION_MODEL)
+    service._engine_synced = True
+
+    asyncio.run(_confirm_guard(lambda guard: service.set_agent_chain(
+        "claude",
+        _PROJECTION_MODEL,
+        {"hops": [
+            {"source_id": "src_official01", "model_id": _PROJECTION_MODEL},
+            {"source_id": "src_official01", "model_id": "vision-model"},
+            {"source_id": "src_official01", "model_id": "routed-text-model"},
+            {"source_id": "src_relayurl01", "model_id": _PROJECTION_MODEL},
+            {"source_id": "src_custom0001", "model_id": _PROJECTION_MODEL},
+        ], **guard},
+    )))
+
+    [synced] = adapter.synced
+    by_id = {binding.source_id: binding for binding in synced}
+    assert {"vision-model", "routed-text-model"} <= set(by_id["src_official01"].route_model_ids)
+    assert by_id["src_official01"].text_only_model_ids == (_PROJECTION_MODEL,)
+    assert by_id["src_relayurl01"].text_only_model_ids == ()
+    assert by_id["src_custom0001"].text_only_model_ids == ()
+    assert refreshes == []
+
+
+def test_engine_sync_survives_a_source_whose_stored_port_cannot_be_read(tmp_path):
+    """MH-MODALITIES-002: optional modality metadata never fails a sync, even for a URL an older release stored."""
+
+    service, store, adapter = _service(tmp_path)
+    _vendor_route_fixture(store, _PROJECTION_MODEL)
+    store.config.sources[1].base_url = "https://api.deepseek.com:bad/v1"
+    _cache_models_dev({"deepseek": {_PROJECTION_MODEL: {"modalities": {"input": ["text"]}}}})
+
+    asyncio.run(service.runtime_start())
+
+    by_id = {binding.source_id: binding for binding in adapter.synced[-1]}
+    assert by_id["src_official01"].text_only_model_ids == (_PROJECTION_MODEL,)
+    assert by_id["src_relayurl01"].text_only_model_ids == ()
+
+
+def test_runtime_start_recomputes_text_only_marks_from_the_current_catalog_copy(tmp_path):
+    """MH-MODALITIES-002: an explicit start renders marks from today's copy, not the copy of the last sync."""
+
+    service, store, adapter = _service(tmp_path)
+    _vendor_route_fixture(store, _PROJECTION_MODEL)
+    _cache_models_dev({"deepseek": {_PROJECTION_MODEL: {"modalities": {"input": ["text"]}}}})
+    asyncio.run(service.runtime_start())
+    assert adapter.synced[-1][0].text_only_model_ids == (_PROJECTION_MODEL,)
+
+    # The copy refreshes while the engine keeps its projection; a stop and a
+    # start later, the model is known to accept images.
+    _cache_models_dev({"deepseek": {_PROJECTION_MODEL: {"modalities": {"input": ["text", "image"]}}}})
+    for agent in store.config.agents.values():
+        agent.mode = "direct"
+    asyncio.run(service.runtime_stop())
+    asyncio.run(service.runtime_start())
+
+    assert len(adapter.synced) == 2
+    assert adapter.synced[-1][0].text_only_model_ids == ()
+    assert adapter.start_calls == 2
 
 
 def test_source_adoption_projection_is_sorted_by_backend_and_menu_model(tmp_path):

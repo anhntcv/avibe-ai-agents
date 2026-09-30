@@ -114,6 +114,7 @@ class SourceRecord:
     prefix: str
     model_reasoning_efforts: tuple[tuple[str, tuple[str, ...]], ...] = ()
     route_model_ids: tuple[str, ...] = ()
+    text_only_model_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> SourceRecord:
@@ -162,7 +163,24 @@ class SourceRecord:
             prefix=str(payload["prefix"]),
             model_reasoning_efforts=tuple(parsed_reasoning_efforts),
             route_model_ids=tuple(route_model_ids),
+            text_only_model_ids=_stored_text_only_model_ids(
+                str(payload["source_id"]), payload.get("text_only_model_ids", [])
+            ),
         )
+
+
+def _stored_text_only_model_ids(source_id: str, raw: object) -> tuple[str, ...]:
+    # Undeclared input is the engine's default, so a list this release cannot
+    # read degrades to that rather than failing the source. The next sync
+    # rewrites it; until then the Source's images are forwarded, and the log
+    # says why.
+    if not isinstance(raw, list) or not all(isinstance(model, str) and model for model in raw):
+        logger.warning(
+            "Engine source %s has an unreadable text-only model list; its models are undeclared until the next sync",
+            source_id,
+        )
+        return ()
+    return tuple(dict.fromkeys(raw))
 
 
 class EngineStateStore:
@@ -642,6 +660,25 @@ class EngineStateStore:
                         continue
                     spellings[normalized_model_id] = answered
                     reasoning_by_model[normalized_model_id] = normalized_efforts
+                normalized_route_model_ids = tuple(
+                    sorted(
+                        {
+                            model_id_without_credential_address(model, prefix)
+                            for model in route_model_ids
+                        }
+                    )
+                )
+                text_only_model_ids = tuple(
+                    dict.fromkeys(
+                        model_id_without_credential_address(str(model).strip(), prefix)
+                        for model in binding.text_only_model_ids
+                    )
+                )
+                if any(
+                    model not in (*model_ids, *normalized_route_model_ids)
+                    for model in text_only_model_ids
+                ):
+                    raise EngineStateError("text-only model id is not registered")
                 records.append(
                     SourceRecord(
                         source_id=source_id,
@@ -651,16 +688,10 @@ class EngineStateStore:
                         credential_ref=credential_ref,
                         allowed_origins=allowed_origins,
                         model_ids=model_ids,
-                        route_model_ids=tuple(
-                            sorted(
-                                {
-                                    model_id_without_credential_address(model, prefix)
-                                    for model in route_model_ids
-                                }
-                            )
-                        ),
+                        route_model_ids=normalized_route_model_ids,
                         prefix=prefix,
                         model_reasoning_efforts=tuple(reasoning_by_model.items()),
+                        text_only_model_ids=text_only_model_ids,
                     )
                 )
             self._write_sources(records)
@@ -694,11 +725,17 @@ class EngineStateStore:
                 for model_id, efforts in current.model_reasoning_efforts
                 if model_id in models
             )
+            retained_text_only = tuple(
+                model_id
+                for model_id in current.text_only_model_ids
+                if model_id in models or model_id in current.route_model_ids
+            )
             updated_record = SourceRecord(
                 **{
                     **asdict(current),
                     "model_ids": models,
                     "model_reasoning_efforts": retained_reasoning,
+                    "text_only_model_ids": retained_text_only,
                 }
             )
             self._write_sources([updated_record if source.source_id == source_id else source for source in sources])
@@ -1167,6 +1204,7 @@ class EngineStateStore:
                             [model_id, list(efforts)]
                             for model_id, efforts in source.model_reasoning_efforts
                         ],
+                        "text_only_model_ids": list(source.text_only_model_ids),
                     }
                     for source in sources
                 ]

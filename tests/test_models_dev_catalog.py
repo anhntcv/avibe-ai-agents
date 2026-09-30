@@ -375,6 +375,98 @@ def test_exact_models_dev_matches_never_borrow_a_neighbour():
     assert models_dev_catalog.exact_models_dev_matches(["gpt-target"], {}) == {}
 
 
+def _entry(declared: object, **fields: object) -> dict:
+    return {**fields, "modalities": {"input": declared}}
+
+
+@pytest.mark.parametrize(
+    ("entries", "requested", "text_only"),
+    [
+        ({"target": _entry(["text"])}, "target", True),
+        ({"target": _entry([" TEXT ", "pdf"])}, "target", True),
+        ({"target": _entry(["text", "image"])}, "target", False),
+        ({"target": _entry(["text", " Image "])}, "target", False),
+        # Undeclared or malformed input leaves the model undeclared.
+        ({"target": {"name": "No modalities"}}, "target", False),
+        ({"target": _entry([])}, "target", False),
+        ({"target": _entry(["text", 1])}, "target", False),
+        ({"target": _entry("text")}, "target", False),
+        ({"target": "not-an-object"}, "target", False),
+        ({"target": _entry(["image"])}, "target", False),
+        # Model identity is Avibe's: trimmed, case preserved.
+        ({"target": _entry(["text"])}, " target ", True),
+        ({"target": _entry(["text"])}, "TARGET", False),
+        ({"TARGET": _entry(["text", "image"]), "target": _entry(["text"])}, "TARGET", False),
+        # An entry is found by its key or its id; one that disagrees vetoes.
+        ({"hosted-7": _entry(["text"], id="target")}, "target", True),
+        ({"target": _entry(["text"]), "alias": _entry(["text", "image"], id="target")}, "target", False),
+        ({"other": _entry(["text"])}, "target", False),
+    ],
+)
+def test_text_only_reads_the_upstream_providers_own_entry(entries, requested, text_only):
+    """MH-MODALITIES-004: a model is text-only when its upstream provider's own entry declares text and no image."""
+
+    catalog = {"deepseek": {"models": entries}}
+
+    assert models_dev_catalog.text_only_model_ids("deepseek", [requested], catalog) == (
+        {requested} if text_only else set()
+    )
+
+
+def test_text_only_never_reads_another_providers_copy():
+    """MH-MODALITIES-004: a relay's declaration describes the relay, so it neither marks nor vetoes the vendor."""
+
+    catalog = {
+        "zhipuai": {"models": {"glm-5.2": _entry(["text"])}},
+        "baseten": {"models": {"zai-org/GLM-5.2": _entry(["text", "image"])}},
+        "relay": {"models": {"deepseek-model": _entry(["text"])}},
+        "deepseek": {"models": {}},
+    }
+
+    assert models_dev_catalog.text_only_model_ids("zhipuai", ["glm-5.2"], catalog) == {"glm-5.2"}
+    assert models_dev_catalog.text_only_model_ids("deepseek", ["deepseek-model"], catalog) == set()
+
+
+def test_text_only_warns_about_an_unreadable_provider_without_touching_others(caplog):
+    """MH-MODALITIES-004: an unreadable or missing provider declares nothing and says so; other providers are unaffected."""
+
+    catalog = {
+        "deepseek": {"models": [_entry(["text"])]},
+        "zhipuai": {"models": {"glm-5": _entry(["text"])}},
+    }
+
+    with caplog.at_level("WARNING", logger=models_dev_catalog.__name__):
+        assert models_dev_catalog.text_only_model_ids("deepseek", ["deepseek-model"], catalog) == set()
+        assert models_dev_catalog.text_only_model_ids("zhipuai", ["glm-5"], catalog) == {"glm-5"}
+        assert models_dev_catalog.text_only_model_ids("groq", ["model"], catalog) == set()
+        # No cached copy yet is not a fault.
+        assert models_dev_catalog.text_only_model_ids("groq", ["model"], {}) == set()
+
+    messages = [record.getMessage() for record in caplog.records if record.name == models_dev_catalog.__name__]
+    assert len(messages) == 2
+    assert "deepseek" in messages[0] and "zhipuai" not in messages[0]
+    assert "groq" in messages[1]
+
+
+def test_cached_catalog_read_does_not_wait_on_a_foreground_fetch(monkeypatch, tmp_path):
+    """MH-MODALITIES-002: an engine sync reads the cached copy while a picker fetch holds the cache lock."""
+
+    import threading
+
+    monkeypatch.setattr(models_dev_catalog, "_cache_path", lambda: tmp_path / "models_dev_catalog.json")
+    models_dev_catalog._write_cache({"url": models_dev_catalog._models_dev_url(), "fetched_at": 0, "catalog": _catalog()})
+    read: list[dict] = []
+    with models_dev_catalog._CACHE_LOCK:
+        reader = threading.Thread(target=lambda: read.append(models_dev_catalog.cached_models_dev_catalog()))
+        reader.start()
+        reader.join(timeout=5)
+        waited = reader.is_alive()
+    reader.join(timeout=5)
+
+    assert not waited
+    assert read == [_catalog()]
+
+
 def test_first_catalog_read_reports_one_fetch_in_flight_until_it_fails(monkeypatch, tmp_path):
     """MH-PRICE-014: With no cached copy, readers start one fetch and say one is coming; after a failure they do not."""
 

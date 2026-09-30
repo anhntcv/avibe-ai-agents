@@ -120,6 +120,9 @@ class APIKeyVendorCatalogEntry:
     label: str
     official_base_url: str
     protocol: str
+    # The models.dev provider whose entries describe what this vendor's
+    # official endpoint accepts; ``None`` when no mapping has been verified.
+    models_dev_provider: str | None = None
 
 
 def _catalog_path() -> Path:
@@ -141,6 +144,7 @@ def api_key_vendor_catalog() -> tuple[APIKeyVendorCatalogEntry, ...]:
         label = item.get("label")
         protocol = item.get("protocol")
         official_base_url = normalize_model_hub_base_url(item.get("official_base_url"))
+        models_dev_provider = item.get("models_dev_provider")
         if (
             vendor_id == "custom"
             or vendor_id in seen_ids
@@ -149,6 +153,10 @@ def api_key_vendor_catalog() -> tuple[APIKeyVendorCatalogEntry, ...]:
             or not isinstance(protocol, str)
             or protocol not in _SUPPORTED_PROTOCOLS
             or official_base_url is None
+            or (
+                models_dev_provider is not None
+                and (not isinstance(models_dev_provider, str) or not models_dev_provider.strip())
+            )
         ):
             raise ValueError("api-key vendor catalog is invalid")
         entries.append(
@@ -157,6 +165,7 @@ def api_key_vendor_catalog() -> tuple[APIKeyVendorCatalogEntry, ...]:
                 label=label.strip(),
                 official_base_url=official_base_url,
                 protocol=protocol,
+                models_dev_provider=models_dev_provider.strip() if models_dev_provider else None,
             )
         )
         seen_ids.add(vendor_id)
@@ -188,6 +197,50 @@ def official_api_key_base_url(vendor: str) -> str | None:
     if entry is not None:
         return entry.official_base_url
     return _LEGACY_OFFICIAL_BASE_URLS.get(normalized_vendor)
+
+
+def openai_compatible_endpoint(base_url: str) -> str:
+    """The API root the engine calls for an ``openai_chat`` Source's base URL.
+
+    CLIProxyAPI appends ``/chat/completions``; a Source origin without a path
+    uses the standard ``/v1`` root that discovery and probes use.
+    """
+    endpoint = normalize_model_hub_base_url(base_url)
+    assert endpoint is not None
+    if not urlsplit(endpoint).path.rstrip("/"):
+        endpoint = normalize_model_hub_base_url(endpoint, append_path="/v1")
+        assert endpoint is not None
+    return endpoint
+
+
+def _endpoint_identity(base_url: str) -> tuple[str, str, int | None, str, str] | None:
+    parts = urlsplit(openai_compatible_endpoint(base_url))
+    try:
+        port = parts.port or {"http": 80, "https": 443}.get(parts.scheme)
+    except ValueError:
+        # A stored URL may carry a port no connection can use; it names no
+        # official endpoint.
+        return None
+    return parts.scheme, parts.hostname or "", port, parts.path, parts.query
+
+
+def official_models_dev_provider(vendor: str, base_url: str | None) -> str | None:
+    """The models.dev provider describing an ``openai_chat`` Source's upstream, or ``None``.
+
+    Only a Source on its vendor's official endpoint is described by that
+    vendor's models.dev entries: a custom URL may front any deployment. The
+    endpoint is the one the engine calls, so spellings of one URL that differ
+    only by host case, a default port, or the implied ``/v1`` root agree.
+    """
+    entry = api_key_vendor_entry(vendor)
+    if entry is None or entry.models_dev_provider is None:
+        return None
+    if base_url is not None and (
+        _endpoint_identity(base_url) is None
+        or _endpoint_identity(base_url) != _endpoint_identity(entry.official_base_url)
+    ):
+        return None
+    return entry.models_dev_provider
 
 
 def official_api_key_base_urls() -> dict[str, str]:

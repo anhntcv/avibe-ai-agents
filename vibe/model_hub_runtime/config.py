@@ -8,7 +8,11 @@ import yaml
 
 from config.atomic_io import write_atomic
 from config.v2_config import normalize_model_hub_base_url
-from vibe.model_hub_runtime.api_key_vendors import official_api_key_base_url, validate_api_key_auth_scheme
+from vibe.model_hub_runtime.api_key_vendors import (
+    official_api_key_base_url,
+    openai_compatible_endpoint,
+    validate_api_key_auth_scheme,
+)
 from vibe.model_hub_runtime.state import EngineStateError, EngineStateStore, RuntimeSecrets, SourceRecord
 
 
@@ -117,8 +121,19 @@ def _append_source(
     except ValueError:
         raise EngineStateError("unsupported API key authentication scheme") from None
     reasoning_by_model = dict(source.model_reasoning_efforts)
+    # CLIProxyAPI reads input modalities only on openai-compatibility models,
+    # matching an entry by name, then alias. For one declared text-only it
+    # replaces tool-result images with a marker; any other list, or none,
+    # keeps images, so text-only is the only declaration worth writing.
+    # Its name match is looser than a routed ID (see _engine_model_name) and
+    # takes the first entry that matches, so models it cannot tell apart are
+    # declared text-only together or not at all.
+    routed = tuple(dict.fromkeys((*source.model_ids, *source.route_model_ids)))
+    marked = set(source.text_only_model_ids) if source.protocol == "openai_chat" else set()
+    unmarked_names = {_engine_model_name(model) for model in routed if model not in marked}
+    text_only = {model for model in marked if _engine_model_name(model) not in unmarked_names}
     models = []
-    for model in dict.fromkeys((*source.model_ids, *source.route_model_ids)):
+    for model in routed:
         entry: dict[str, Any] = {
             "name": model,
             "alias": model,
@@ -128,6 +143,8 @@ def _append_source(
         if reasoning_efforts:
             # CLIProxyAPI's measured model-registration shape is strongest-first.
             entry["thinking"] = {"levels": list(reversed(reasoning_efforts))}
+        if model in text_only:
+            entry["input-modalities"] = ["text"]
         models.append(entry)
     if source.protocol == "anthropic":
         base_url = source.base_url
@@ -163,21 +180,11 @@ def _append_source(
             base_url = official_api_key_base_url(source.vendor)
         if not base_url:
             raise EngineStateError("OpenAI-compatible source requires a base URL")
-        normalized_base_url = normalize_model_hub_base_url(base_url)
-        assert normalized_base_url is not None
-        if not urlsplit(normalized_base_url).path.rstrip("/"):
-            # CLIProxyAPI appends /chat/completions; Source origins use the
-            # standard /v1 endpoint root used by discovery and probes.
-            normalized_base_url = normalize_model_hub_base_url(
-                normalized_base_url,
-                append_path="/v1",
-            )
-            assert normalized_base_url is not None
         payload.setdefault("openai-compatibility", []).append(
             {
                 "name": source.prefix,
                 "prefix": source.prefix,
-                "base-url": normalized_base_url,
+                "base-url": openai_compatible_endpoint(base_url),
                 "api-key-entries": [{"api-key": api_key}],
                 "models": models,
             }
@@ -200,6 +207,19 @@ def expected_model_names(
         for model in (*source.model_ids, *source.route_model_ids):
             expected[f"{source.prefix}/{model}"] = reload_display_name(model, generation)
     return expected
+
+
+def _engine_model_name(model: str) -> str:
+    """The name CLIProxyAPI compares when it looks up a model's input modalities.
+
+    It trims the name, drops a trailing ``(...)`` thinking suffix, trims again,
+    and compares case-insensitively.
+    """
+    name = model.strip()
+    suffix = name.rfind("(")
+    if suffix != -1 and name.endswith(")"):
+        name = name[:suffix]
+    return name.strip().casefold()
 
 
 def reload_display_name(model: str, generation: str) -> str:
