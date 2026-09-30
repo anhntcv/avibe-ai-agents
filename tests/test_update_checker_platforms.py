@@ -1056,3 +1056,141 @@ def test_fetch_pypi_version_sync_ignores_prerelease_for_stable_current(monkeypat
     assert req.full_url == "https://pypi.org/pypi/avibe-os/json"
     assert req.headers["User-agent"] == "avibe-os"
     assert info == {"current": "2.2.7", "latest": "2.2.7", "has_update": False, "error": None}
+
+
+def _backend_auto_update_checker(monkeypatch, tmp_path, sqlite_schema_db_factory, coordinator, runtimes, install):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    sqlite_schema_db_factory(tmp_path / "state" / "vibe.sqlite")
+    SettingsStore.reset_instance()
+    controller = _StubController(SettingsStore.get_instance())
+    controller.backend_restart_coordinator = coordinator
+    monkeypatch.setattr(
+        "vibe.api.get_backend_runtime",
+        lambda name: {"ok": True, "enabled": True, "installed": True, **runtimes[name]},
+    )
+    monkeypatch.setattr("vibe.api.install_agent", install)
+    monkeypatch.setattr("vibe.api.reconcile_askill_auto_update", lambda: {"ok": True, "skipped": True})
+    monkeypatch.setattr(
+        update_checker,
+        "_fetch_pypi_version_sync",
+        lambda: {"current": "1.0.0", "latest": "1.0.0", "has_update": False, "error": None},
+    )
+    checker = UpdateChecker(controller, UpdateConfig(check_interval_minutes=60, idle_minutes=30))
+    checker.state.last_activity_at = time.time() - 3600
+    return checker
+
+
+def test_backend_auto_update_retries_a_release_until_it_lands_or_its_install_fails(
+    monkeypatch, tmp_path, sqlite_schema_db_factory
+):
+    admissions = []
+    coordinator_state = {"busy": True, "refresh_fails": False}
+
+    class _Coordinator:
+        async def run_when_idle(self, backend, operation):
+            admissions.append(backend)
+            if coordinator_state["busy"]:
+                return None
+            result = await operation()
+            if coordinator_state["refresh_fails"]:
+                raise RuntimeError("refresh failed")
+            return result
+
+    runtimes = {
+        "codex": {"auto_update": True, "has_update": True, "latest_version": "1.1.0"},
+        "claude": {"auto_update": False, "has_update": True, "latest_version": "2.0.0"},
+        "opencode": {"auto_update": True, "has_update": False, "latest_version": "1.0.0"},
+    }
+    install_results = [
+        {"ok": False, "code": "install_locked", "message": "Another Codex installation is already running."},
+        {"ok": True},
+        {"ok": False, "code": "install_failed", "message": "Could not upgrade Codex."},
+        {"ok": True},
+    ]
+    installs = []
+
+    def install(name):
+        installs.append(name)
+        return install_results.pop(0)
+
+    checker = _backend_auto_update_checker(
+        monkeypatch, tmp_path, sqlite_schema_db_factory, _Coordinator(), runtimes, install
+    )
+
+    # A message inside the quiet window defers every backend, like Avibe's own update.
+    checker.state.last_activity_at = time.time() - 60
+    asyncio.run(checker._do_check())
+    assert admissions == []
+
+    checker.state.last_activity_at = time.time() - 3600
+    asyncio.run(checker._do_check())  # codex has a turn running
+    coordinator_state["busy"] = False
+    asyncio.run(checker._do_check())  # a manual install holds the CLI
+    asyncio.run(checker._do_check())  # the installer succeeds without reaching the release
+    coordinator_state["refresh_fails"] = True
+    asyncio.run(checker._do_check())  # the install fails, then so does the refresh
+    coordinator_state["refresh_fails"] = False
+    asyncio.run(checker._do_check())  # the failed release is not retried
+
+    assert admissions == ["codex"] * 4
+    assert installs == ["codex"] * 3
+    assert update_checker.UpdateState.load().backend_auto_update_attempts == {"codex": "1.1.0"}
+
+    runtimes["codex"]["latest_version"] = "1.2.0"
+    asyncio.run(checker._do_check())  # a newer release is tried again
+
+    assert installs == ["codex"] * 4
+
+
+def test_backend_auto_update_stops_admitting_backends_once_a_message_arrives(
+    monkeypatch, tmp_path, sqlite_schema_db_factory
+):
+    admissions = []
+
+    class _Coordinator:
+        async def run_when_idle(self, backend, operation):
+            admissions.append(backend)
+            return await operation()
+
+    def install(name):
+        # The first backend's install outlasts the quiet window.
+        checker.record_activity()
+        return {"ok": True}
+
+    runtimes = {
+        name: {"auto_update": True, "has_update": True, "latest_version": "9.0.0"}
+        for name in ("codex", "claude", "opencode")
+    }
+    checker = _backend_auto_update_checker(
+        monkeypatch, tmp_path, sqlite_schema_db_factory, _Coordinator(), runtimes, install
+    )
+
+    asyncio.run(checker._do_check())
+
+    assert len(admissions) == 1
+
+
+@pytest.mark.parametrize("attempts", [None, ["codex"]])
+def test_update_state_without_backend_attempts_loads_released_fields(monkeypatch, tmp_path, attempts):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    released = {
+        "notified_version": "3.0.3",
+        "notified_at": "2026-09-01T00:00:00Z",
+        "last_check_at": "2026-09-01T00:00:00Z",
+        "last_activity_at": 1767225600.0,
+        "blocked_auto_update_version": None,
+        "blocked_auto_update_reason": None,
+        "blocked_auto_update_at": None,
+        "blocked_auto_update_current_version": None,
+    }
+    if attempts is not None:
+        released["backend_auto_update_attempts"] = attempts
+    path = tmp_path / "state" / "update_state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(released), encoding="utf-8")
+
+    state = update_checker.UpdateState.load()
+
+    assert state.notified_version == "3.0.3"
+    assert state.last_activity_at == 1767225600.0
+    assert state.backend_auto_update_attempts == {}

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from core.backend_restart import BackendRestartCoordinator
+from core.backend_restart import BackendRestartCoordinator, NativeCredentialLease, NativeMigrationBlockedError
 from core.controller import Controller
 
 
@@ -269,5 +269,148 @@ def test_cancelled_application_remains_failed_after_task_is_removed():
             await task
         assert coordinator.snapshot("opencode") == {"state": "failed", "error": "cancelled"}
         assert not service.draining
+
+    asyncio.run(run())
+
+
+def test_idle_maintenance_runs_behind_closed_admission_then_refreshes():
+    async def run():
+        service = _AgentService()
+        controller = _controller(service)
+        refresh = AsyncMock()
+        coordinator = BackendRestartCoordinator(controller, refresh, poll_interval=0.001)
+
+        async def install():
+            # Nothing may start a turn on the CLI while it is being replaced.
+            assert service.draining is True
+            controller.session_turns.begin_backend_drain.assert_called_once_with("opencode")
+            refresh.assert_not_awaited()
+            return {"ok": True}
+
+        assert await coordinator.run_when_idle("opencode", install) == {"ok": True}
+
+        refresh.assert_awaited_once_with("opencode", False)
+        controller.session_turns.end_backend_drain.assert_awaited_once_with("opencode", resume_deferred=True)
+        assert service.draining is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("holder", ["active_turn", "restart_draining"])
+def test_maintenance_yields_to_a_busy_backend_without_touching_its_work(holder):
+    async def run():
+        service = _AgentService()
+        service.active = True
+        controller = _controller(service)
+        refresh = AsyncMock()
+        coordinator = BackendRestartCoordinator(controller, refresh, drain_timeout=1, poll_interval=0.001)
+        if holder == "restart_draining":
+            assert await coordinator.request_restart("opencode") == "draining"
+            controller.session_turns.end_backend_drain.reset_mock()
+        operation = AsyncMock()
+
+        assert await coordinator.run_when_idle("opencode", operation) is None
+
+        operation.assert_not_awaited()
+        refresh.assert_not_awaited()
+        controller.session_turns.release_for_backend_refresh.assert_not_awaited()
+        if holder == "active_turn":
+            # The turn keeps running; messages held meanwhile resume unchanged.
+            controller.session_turns.end_backend_drain.assert_awaited_once_with("opencode")
+            assert service.draining is False
+        else:
+            controller.session_turns.end_backend_drain.assert_not_awaited()
+            assert service.draining is True
+            service.active = False
+            await coordinator.wait("opencode")
+            refresh.assert_awaited_once_with("opencode", False)
+
+    asyncio.run(run())
+
+
+def test_maintenance_and_a_native_login_exclude_each_other():
+    async def run():
+        service = _AgentService()
+        controller = _controller(service)
+        refresh = AsyncMock()
+        coordinator = BackendRestartCoordinator(controller, refresh, poll_interval=0.001)
+        operation = AsyncMock()
+
+        # A login in the Web process holds the backend's lease for its whole flow.
+        login = NativeCredentialLease(("opencode",)).acquire()
+        try:
+            assert await coordinator.run_when_idle("opencode", operation) is None
+        finally:
+            login.release()
+        operation.assert_not_awaited()
+        controller.session_turns.begin_backend_drain.assert_not_called()
+
+        async def install():
+            with pytest.raises(NativeMigrationBlockedError) as blocked:
+                NativeCredentialLease(("opencode",)).acquire()
+            assert blocked.value.reason == "native_auth_in_progress"
+            return {"ok": True}
+
+        assert await coordinator.run_when_idle("opencode", install) == {"ok": True}
+        NativeCredentialLease(("opencode",)).acquire().release()
+
+    asyncio.run(run())
+
+
+def test_cancelled_requester_waits_for_maintenance_and_its_refresh():
+    async def run():
+        service = _AgentService()
+        controller = _controller(service)
+        refresh = AsyncMock()
+        coordinator = BackendRestartCoordinator(controller, refresh, poll_interval=0.001)
+        installing = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def install():
+            installing.set()
+            await finish.wait()
+            return {"ok": True}
+
+        requester = asyncio.create_task(coordinator.run_when_idle("opencode", install))
+        await installing.wait()
+        requester.cancel()
+        await asyncio.sleep(0.01)
+        # Shutdown cancels the update checker; the CLI swap must not be abandoned.
+        assert not requester.done()
+
+        finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await requester
+        refresh.assert_awaited_once_with("opencode", False)
+        assert service.draining is False
+
+    asyncio.run(run())
+
+
+def test_restart_requested_during_maintenance_is_applied_by_its_refresh():
+    async def run():
+        service = _AgentService()
+        service.agents = {"opencode": object()}
+        controller = _controller(service)
+        refresh = AsyncMock()
+        coordinator = BackendRestartCoordinator(controller, refresh, poll_interval=0.001)
+        installing = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def install():
+            installing.set()
+            await finish.wait()
+            return {"ok": True}
+
+        maintenance = asyncio.create_task(coordinator.run_when_idle("opencode", install))
+        await installing.wait()
+        assert coordinator.snapshot("opencode") == {"state": "draining"}
+        assert await coordinator.request_restart("opencode") == "draining"
+        controller.session_turns.begin_backend_drain.assert_called_once_with("opencode")
+
+        finish.set()
+        assert await maintenance == {"ok": True}
+        refresh.assert_awaited_once_with("opencode", False)
+        assert coordinator.snapshot("opencode") == {"state": "applied"}
 
     asyncio.run(run())

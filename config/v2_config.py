@@ -938,6 +938,10 @@ _RUNTIME_RETENTION_FIELDS = frozenset(
     }
 )
 
+# A backend's unattended-upgrade switch recovers alone and off, keeping the
+# backend's CLI path, credentials, and enablement.
+_BACKEND_AUTO_UPDATE_FIELD = "auto_update"
+
 # The switch that decides whether an optional feature runs at all. Named once
 # because recovery has to tell it apart from every other switch in a section:
 # the rest describe how a feature behaves, this one decides whether it happens.
@@ -1009,6 +1013,10 @@ def _recovery_field_for_error(section: Optional[str], error: BaseException) -> O
             return None
         field_name = path[len(prefix) :].split(".", 1)[0]
         return field_name if field_name in _RUNTIME_RETENTION_FIELDS or field_name == "skill_observability_enabled" else None
+    if section is not None and section.startswith("agents."):
+        match = re.search(r"Config '([^']+)'", str(error))
+        auto_update = f"{section}.{_BACKEND_AUTO_UPDATE_FIELD}"
+        return _BACKEND_AUTO_UPDATE_FIELD if match and match.group(1) == auto_update else None
     if section not in _FIELD_SCOPED_RECOVERY_SECTIONS:
         return None
     match = re.search(r"Config '([^']+)'", str(error))
@@ -1175,6 +1183,9 @@ def _reset_recoverable_config_section(
         agents_payload = payload.get("agents")
         if not isinstance(agents_payload, dict):
             return False
+        if field_name == _BACKEND_AUTO_UPDATE_FIELD and isinstance(agents_payload.get(agent_name), dict):
+            agents_payload[agent_name][field_name] = False
+            return True
         if agent_name == "codex":
             # Codex is opt-in in the canonical first-run/recovery config.
             agents_payload[agent_name] = dict(V2Config.default().agents.codex.__dict__)
@@ -1908,6 +1919,10 @@ class RuntimeConfig:
 class OpenCodeConfig:
     enabled: bool = True
     cli_path: str = "opencode"
+    # Install a newer release of this backend CLI once no turn is using it.
+    # Runs on the Avibe update checker, so ``update.check_interval_minutes = 0``
+    # also stops it.
+    auto_update: bool = True
     default_agent: Optional[str] = None
     default_reasoning_effort: Optional[str] = None
     error_retry_limit: int = DEFAULT_OPENCODE_ERROR_RETRY_LIMIT  # Max retries on LLM stream errors (0 = no retry)
@@ -1930,6 +1945,7 @@ class OpenCodeConfig:
 class ClaudeConfig:
     enabled: bool = True
     cli_path: str = "claude"
+    auto_update: bool = True  # See ``OpenCodeConfig.auto_update``.
     idle_timeout_seconds: int = DEFAULT_AGENT_IDLE_TIMEOUT_SECONDS
     # Auth model: "oauth" relies on Claude Code's own credential storage;
     # "api_key" injects ANTHROPIC_API_KEY (and optionally ANTHROPIC_BASE_URL)
@@ -1954,6 +1970,7 @@ class ClaudeConfig:
 class CodexConfig:
     enabled: bool = True
     cli_path: str = "codex"
+    auto_update: bool = True  # See ``OpenCodeConfig.auto_update``.
     idle_timeout_seconds: int = DEFAULT_AGENT_IDLE_TIMEOUT_SECONDS
     # Auth model: "oauth" defers to whatever ~/.codex/config.toml already
     # has (typically `auth.method = "ChatGPT"`); "api_key" writes the
@@ -3573,7 +3590,7 @@ class V2Config:
                 # Diff each reset on its own: ``from_payload`` normalizes a few
                 # stored values in place, and those are not recovery's rewrites.
                 for path in {
-                    tuple(recovered.split(".", 1)),
+                    tuple(recovered.split(".")[:_RECOVERY_REGION_DEPTH]),
                     *_changed_config_paths(before_reset, candidate),
                 }:
                     rewritten.setdefault(path, set()).add(recovered)
@@ -3716,6 +3733,11 @@ class V2Config:
         opencode = OpenCodeConfig(**_filter_dataclass_fields(OpenCodeConfig, opencode_payload))
         claude = ClaudeConfig(**_filter_dataclass_fields(ClaudeConfig, claude_payload))
         codex = CodexConfig(**_filter_dataclass_fields(CodexConfig, codex_payload))
+        for backend_name, backend_config in (("opencode", opencode), ("claude", claude), ("codex", codex)):
+            # Unattended upgrades run on this switch, so ``"false"`` must read as off.
+            backend_config.auto_update = _named_bool(
+                f"agents.{backend_name}.auto_update", backend_config.auto_update
+            )
         avault = AVaultConfig(**_filter_dataclass_fields(AVaultConfig, avault_payload))
 
         agents = AgentsConfig(
