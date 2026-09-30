@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
+from core.run_settlement import SETTLED_BY_BACKEND_REFRESH
 from core.session_activities import SessionActivityRegistry
 from core.message_output import (
     HARNESS_PROMPT_ECHO_SPEC_KEY,
@@ -191,7 +192,14 @@ class AgentService:
             return True
 
     def force_end_backend_activities(self, backend: str) -> list[Any]:
-        completed = self.activities.end_backend(backend, status="killed")
+        """End every Activity of a runtime the service is tearing down itself."""
+        # The cause rides on each Activity it ends, so a settlement retried
+        # after a transient failure or a restart still reports the refresh.
+        completed = self.activities.end_backend(
+            backend,
+            status="killed",
+            metadata={"interrupt_reason": SETTLED_BY_BACKEND_REFRESH},
+        )
         for activity in completed:
             self.on_activity_terminal(activity)
         return completed

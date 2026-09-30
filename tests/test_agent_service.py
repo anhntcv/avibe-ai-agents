@@ -649,9 +649,13 @@ def test_agent_service_restart_wait_releases_gate_when_backend_disappears() -> N
 
 
 def test_force_end_backend_activities_settles_pending_runs() -> None:
+    """MH-MIG-012: the service ending an Activity itself names that cause, so
+    its Runs settle as a runtime-refresh interruption rather than a silent kill."""
     settled = []
     controller = SimpleNamespace(
-        scheduled_task_service=SimpleNamespace(settle_activity_runs=settled.append),
+        scheduled_task_service=SimpleNamespace(
+            settle_activity_runs=lambda activity, **kwargs: settled.append((activity, kwargs)),
+        ),
     )
     service = AgentService(controller=controller)
     service.activities.start(
@@ -682,9 +686,9 @@ def test_force_end_backend_activities_settles_pending_runs() -> None:
 
     service.force_end_backend_activities("claude")
 
-    assert sorted((item.id, item.status) for item in settled) == [
-        ("task-active", "killed"),
-        ("task-pending", "killed"),
+    assert sorted((item.id, item.status, item.metadata.get("interrupt_reason")) for item, _ in settled) == [
+        ("task-active", "killed", "backend_refresh"),
+        ("task-pending", "killed", "backend_refresh"),
     ]
     assert service.activities.ack_recovered_terminal.call_count == 2
 

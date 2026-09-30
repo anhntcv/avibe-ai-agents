@@ -4473,7 +4473,7 @@ def test_retained_lost_turn_report_is_retried_on_its_own_clock(managers) -> None
     _first, restarted, _engine, _engine_b, _starts = managers
     emitted, _stamped = _capture_lost_turn_report(restarted)
     restarted.LOST_TURN_RETRY_DELAYS = (0.0, 0.0)
-    restarted._pending_lost_turn_reports["slack"] = [("ses_fsm", "m-origin", "trn-origin", "codex")]
+    restarted._pending_lost_turn_reports["slack"] = [("ses_fsm", "m-origin", "trn-origin", "codex", "turn.interrupted.serviceRestart")]
     failures = 1
 
     async def _emit(_context, kind, text, **_kwargs):
@@ -4507,7 +4507,7 @@ def test_lost_turn_retry_gives_up_instead_of_spinning(managers) -> None:
     _first, restarted, _engine, _engine_b, _starts = managers
     emitted, _stamped = _capture_lost_turn_report(restarted)
     restarted.LOST_TURN_RETRY_DELAYS = (0.0, 0.0)
-    restarted._pending_lost_turn_reports["slack"] = [("ses_fsm", "m-origin", "trn-origin", "codex")]
+    restarted._pending_lost_turn_reports["slack"] = [("ses_fsm", "m-origin", "trn-origin", "codex", "turn.interrupted.serviceRestart")]
 
     async def _emit(_context, kind, text, **_kwargs):
         emitted.append((kind, text))
@@ -4524,7 +4524,7 @@ def test_lost_turn_retry_gives_up_instead_of_spinning(managers) -> None:
 
     # One initial attempt plus one per configured delay, then it stops.
     assert len(emitted) == 3
-    assert restarted._pending_lost_turn_reports["slack"] == [("ses_fsm", "m-origin", "trn-origin", "codex")]
+    assert restarted._pending_lost_turn_reports["slack"] == [("ses_fsm", "m-origin", "trn-origin", "codex", "turn.interrupted.serviceRestart")]
 
 
 def test_lost_turn_owning_a_run_leaves_the_notice_to_the_harness_lane(managers) -> None:
@@ -5396,6 +5396,76 @@ def test_definite_handler_prewrite_exception_requeues_through_terminal_boundary(
     assert turn["start_receipt_outcome"] == "not_written"
 
 
+@pytest.mark.parametrize("first_send_delivers", [True, False], ids=["delivered", "held-then-retried"])
+def test_forced_refresh_tells_a_restored_conversation_turn_why_it_stopped(managers, first_send_delivers) -> None:
+    """MH-MIG-012: a Turn restored across a service restart has no in-flight task,
+    yet a forced refresh still terminalizes it. Its conversation gets the same
+    notice as a live Turn, on the message that started it; without one the
+    thread simply stops. A send that fails is held and retried as that same
+    refresh notice, since it is the only account the user will get."""
+    first, restarted, engine, _engine_b, _starts = managers
+    context = _context()
+    admitted = asyncio.run(
+        first.deliver(
+            DeliveryRequest(
+                session_id="ses_fsm",
+                priority="p3",
+                content="restored turn interrupted by a switch",
+                native_message_id="m-origin",
+            ),
+            context=context,
+        )
+    )
+    turn_id = str(admitted.turn_id)
+    context.platform_specific["turn_token"] = turn_id
+    context.platform_specific["agent_runtime_turn_token"] = f"runtime-{turn_id}"
+    first._active_identity = lambda _backend, _session_id, logical_id: (
+        logical_id,
+        f"native-{logical_id}",
+    )
+    first.on_native_start(
+        context,
+        backend="codex",
+        runtime_key=f"runtime-key-{turn_id}",
+        runtime_turn_id=f"runtime-{turn_id}",
+    )
+    emitted, stamped = _capture_lost_turn_report(restarted)
+    delivered = []
+
+    async def _emit(_context, kind, text, **_kwargs):
+        emitted.append((kind, text))
+        if first_send_delivers or delivered:
+            return "msg-1"
+        delivered.append(False)
+        return None
+
+    restarted.controller.emit_agent_message = _emit
+    restarted.begin_backend_drain("codex")
+
+    async def _go() -> int:
+        released = await restarted.release_for_backend_refresh(
+            backend="codex",
+            base_session_ids={"ses_fsm"},
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return released
+
+    assert asyncio.run(_go()) == 1
+    with engine.connect() as conn:
+        settled = delivery_store.get_turn(conn, turn_id)
+    assert settled is not None and settled["terminal_evidence_kind"] == "backend_refresh"
+    if not first_send_delivers:
+        assert stamped == []
+        assert asyncio.run(restarted.notify_transport_ready("avibe")) == 1
+    assert [kind for kind, _text in emitted] == ["notify"] * (1 if first_send_delivers else 2)
+    assert all(
+        text.startswith("⚠️ This turn was interrupted — its Agent runtime was restarted")
+        for _kind, text in emitted
+    )
+    assert stamped == [("m-origin", INTERRUPTED_REACTION_EMOJI)]
+
+
 def test_forced_backend_refresh_fails_unresolved_start_instead_of_blocking(
     managers,
 ) -> None:
@@ -5429,16 +5499,24 @@ def test_forced_backend_refresh_fails_unresolved_start_instead_of_blocking(
             dispatch_text="ambiguous during forced refresh",
         )
     manager.begin_backend_drain("codex")
+    emitted, _stamped = _capture_lost_turn_report(manager)
 
-    released = asyncio.run(
-        manager.release_for_backend_refresh(
+    async def _go() -> int:
+        released = await manager.release_for_backend_refresh(
             backend="codex",
             base_session_ids={"ses_fsm"},
         )
-    )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return released
+
+    released = asyncio.run(_go())
 
     assert released == 1
     assert _row(engine, delivery_id)["state"] == "retired"
+    # MH-MIG-012: the refresh retired this conversation's input, so it says so.
+    assert [kind for kind, _text in emitted] == ["notify"]
+    assert emitted[0][1].startswith("⚠️ This turn was interrupted — its Agent runtime was restarted")
     with engine.connect() as conn:
         turn = delivery_store.get_turn(conn, turn_id)
         status = conn.execute(

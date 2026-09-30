@@ -31,7 +31,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from core.delivery_target import normalize_message_kind
 from core.agent_input import AgentInputMetadata
-from core.backend_failure import backend_failure_notification_output
+from core.backend_failure import backend_failure_notification_output, harness_run_identity
 from core.message_context import (
     resolve_turn_sink_key,
 )
@@ -645,8 +645,10 @@ class SessionTurnManager:
             str, _SessionLifecycleState
         ] = weakref.WeakValueDictionary()
         # Interruption reports owed to turns whose platform was not connected yet
-        # when recovery ran, keyed by platform. See ``_report_lost_im_turn``.
-        self._pending_lost_turn_reports: dict[str, list[tuple[str, str, str, str]]] = {}
+        # when recovery ran, keyed by platform. See ``_report_interrupted_turn``.
+        # Entries are ``(session_id, origin_native_message_id, turn_id, backend,
+        # message_key)``: the key keeps each held notice's own explanation.
+        self._pending_lost_turn_reports: dict[str, list[tuple[str, str, str, str, str]]] = {}
         # One in-flight retry task per platform for the reports above.
         self._lost_turn_retry_tasks: dict[str, asyncio.Task[None]] = {}
         # The live turn sink per TURN SINK KEY. Each is
@@ -6288,14 +6290,22 @@ class SessionTurnManager:
             return language_getter()
         return getattr(getattr(self.controller, "config", None), "language", "en")
 
-    async def _report_lost_im_turn(
+    async def _report_interrupted_turn(
         self,
         session_id: str,
         origin_native_message_id: str,
         turn_id: str,
         backend: str,
+        *,
+        message_key: str = "turn.interrupted.serviceRestart",
+        context: "MessageContext | None" = None,
     ) -> None:
-        """Tell an IM turn's author that its runtime died with the service.
+        """Tell a turn's author that its runtime died under it.
+
+        The service restarting and a forced runtime refresh both end a Turn that
+        has no Run to carry the news; ``message_key`` names which one, and a held
+        notice keeps it. A live Turn passes its own ``context``; recovery and
+        retries rebuild it from the Session.
 
         An IM turn owns no ``agent_runs`` row, so the Harness interruption lane is
         structurally unreachable for it: notices are stamped on runs, and
@@ -6320,22 +6330,23 @@ class SessionTurnManager:
 
         if self.controller is None:
             return
-        try:
-            context = self._delivery_context(session_id)
-        except Exception:
-            logger.debug(
-                "lost turn report: no delivery context for session=%s",
-                session_id,
-                exc_info=True,
-            )
-            return
+        if context is None:
+            try:
+                context = self._delivery_context(session_id)
+            except Exception:
+                logger.debug(
+                    "lost turn report: no delivery context for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+                return
         platform = str(getattr(context, "platform", "") or "")
-        if self._transport_can_deliver(platform) and await self._emit_lost_turn_report(
-            context, session_id, origin_native_message_id, turn_id, backend
+        if self._transport_can_deliver(platform) and await self._emit_turn_interruption_notice(
+            context, session_id, origin_native_message_id, turn_id, backend, message_key=message_key
         ):
             return
         self._pending_lost_turn_reports.setdefault(platform, []).append(
-            (session_id, str(origin_native_message_id or ""), turn_id, backend)
+            (session_id, str(origin_native_message_id or ""), turn_id, backend, message_key)
         )
         logger.info(
             "lost turn report held until %s transport can deliver (session=%s)",
@@ -6379,8 +6390,8 @@ class SessionTurnManager:
         if not pending or self.controller is None:
             return 0
         reported = 0
-        unsent: list[tuple[str, str, str, str]] = []
-        for session_id, origin_native_message_id, turn_id, backend in pending:
+        unsent: list[tuple[str, str, str, str, str]] = []
+        for session_id, origin_native_message_id, turn_id, backend, message_key in pending:
             try:
                 context = self._delivery_context(session_id)
             except Exception:
@@ -6390,8 +6401,8 @@ class SessionTurnManager:
                     exc_info=True,
                 )
                 continue
-            if await self._emit_lost_turn_report(
-                context, session_id, origin_native_message_id, turn_id, backend
+            if await self._emit_turn_interruption_notice(
+                context, session_id, origin_native_message_id, turn_id, backend, message_key=message_key
             ):
                 reported += 1
             else:
@@ -6399,7 +6410,9 @@ class SessionTurnManager:
                 # transient API error still loses the notice. Popping happened
                 # first, so an unsent report has to be put BACK or the only
                 # record of the interruption is gone for the process's lifetime.
-                unsent.append((session_id, str(origin_native_message_id or ""), turn_id, backend))
+                unsent.append(
+                    (session_id, str(origin_native_message_id or ""), turn_id, backend, message_key)
+                )
         if unsent:
             self._pending_lost_turn_reports.setdefault(platform, []).extend(unsent)
             logger.info(
@@ -6461,13 +6474,15 @@ class SessionTurnManager:
             if self._lost_turn_retry_tasks.get(platform) is asyncio.current_task():
                 self._lost_turn_retry_tasks.pop(platform, None)
 
-    async def _emit_lost_turn_report(
+    async def _emit_turn_interruption_notice(
         self,
         context: "MessageContext",
         session_id: str,
         origin_native_message_id: str,
         turn_id: str,
         backend: str,
+        *,
+        message_key: str = "turn.interrupted.serviceRestart",
     ) -> bool:
         """Emit one interruption notice. ``False`` means it did NOT reach the user.
 
@@ -6482,28 +6497,29 @@ class SessionTurnManager:
             delivered = await self.controller.emit_agent_message(
                 context,
                 "notify",
-                i18n_t("turn.interrupted.serviceRestart", self._controller_language()),
+                i18n_t(message_key, self._controller_language()),
                 # Recovery already settled this Turn. Carry its exact identity
                 # through delayed sends without granting another settlement or
                 # guessing the target from the Session's current Turn.
                 output=backend_failure_notification_output(
                     context,
                     backend,
-                    output=MessageOutput(metadata={"turn_id": turn_id, "replayed": True}),
-                    failure_id=f"turn:{turn_id}",
-                    failure_id_authoritative=True,
+                    output=MessageOutput(metadata={"turn_id": turn_id or None, "replayed": True}),
+                    # A legacy Turn has no durable id; its context token names it.
+                    failure_id=f"turn:{turn_id}" if turn_id else None,
+                    failure_id_authoritative=bool(turn_id),
                 ),
             )
         except Exception:
             logger.warning(
-                "lost turn report: failed to notify session=%s",
+                "turn interruption notice: failed to notify session=%s",
                 session_id,
                 exc_info=True,
             )
             return False
         if not delivered:
             logger.warning(
-                "lost turn report: notify produced no delivery for session=%s",
+                "turn interruption notice: notify produced no delivery for session=%s",
                 session_id,
             )
             return False
@@ -6518,7 +6534,7 @@ class SessionTurnManager:
             await stamp(context, native_message_id, INTERRUPTED_REACTION_EMOJI)
         except Exception:
             logger.debug(
-                "lost turn report: terminal reaction failed for session=%s",
+                "turn interruption notice: terminal reaction failed for session=%s",
                 session_id,
                 exc_info=True,
             )
@@ -6712,7 +6728,7 @@ class SessionTurnManager:
                 continue
             recovered.append(target_session)
             if not owning_run_ids:
-                await self._report_lost_im_turn(target_session, origin_message_id, turn_id, backend)
+                await self._report_interrupted_turn(target_session, origin_message_id, turn_id, backend)
             successor_turn_id = str(terminal.get("successor_turn_id") or "")
             if successor_turn_id:
                 await self._start_persisted_turn(successor_turn_id)
@@ -8082,6 +8098,9 @@ class SessionTurnManager:
         legacy_projection_sessions: set[str] = set()
         tasks_to_settle: list[asyncio.Task] = []
         restored_owners: list[dict[str, Any]] = []
+        # Harness Runs report their own interruption; a conversation turn has
+        # nothing else to tell the user why it stopped.
+        interrupted_turns: list[tuple[str, Turn]] = []
         if self._durable_schema_available():
             with self._sqlite_engine().connect() as conn:
                 # Refresh owns exactly the generation that existed when draining
@@ -8108,9 +8127,19 @@ class SessionTurnManager:
             # Record the cause BEFORE cancelling: this is a runtime refresh, not a
             # user Stop, so a scheduled run this turn owns must not settle as
             # ``canceled`` with the user-stop explanation (Codex P1). ``_run`` reads
-            # it off the Turn when it pops it.
-            turn.cancel_settled_by = SETTLED_BY_BACKEND_REFRESH
+            # it off the Turn when it pops it. An outcome already decided, by a
+            # Stop in flight or a result already delivered, keeps its own cause
+            # and needs no refresh notice.
+            refresh_owns_outcome = not self._turn_outcome_decided(turn)
+            if refresh_owns_outcome:
+                turn.cancel_settled_by = SETTLED_BY_BACKEND_REFRESH
             turn.cancel_defers_queue_resume = True
+            # The same cause for the Run this Turn's dispatch waits on: a backend
+            # whose cancellation cleanup releases the waiter itself would
+            # otherwise report it as a Turn that produced no result.
+            mark_complete = getattr(self.controller, "mark_turn_complete", None)
+            if refresh_owns_outcome and callable(mark_complete) and not turn.task.done():
+                mark_complete(turn.context, settled_by=SETTLED_BY_BACKEND_REFRESH)
             if turn.task.done():
                 self.in_flight.pop(session_id, None)
                 from core.inbox_events import bus
@@ -8122,6 +8151,8 @@ class SessionTurnManager:
             else:
                 turn.task.cancel()
                 tasks_to_settle.append(turn.task)
+                if refresh_owns_outcome and not harness_run_identity(turn.context, None):
+                    interrupted_turns.append((session_id, turn))
             if backend in self._draining_backends:
                 self._deferred_restart_sessions.setdefault(backend, set()).add(session_id)
             released_sessions.add(session_id)
@@ -8132,9 +8163,18 @@ class SessionTurnManager:
         if self.controller is not None:
             for session_id in legacy_projection_sessions:
                 self.controller.set_agent_status(session_id, "idle")
+            for session_id, turn in interrupted_turns:
+                self._notify_backend_refresh(
+                    session_id, "", turn.logical_turn_id or "", backend, context=turn.context
+                )
         released_restored: set[str] = set()
         for owner in restored_owners:
             owner_id = str(owner["id"])
+            # A restored owner has no live context, so read what the notice needs
+            # before terminalizing retires the deliveries it is derived from, as
+            # the service-restart report does.
+            owned_by_run = bool(self.accepted_agent_run_ids_for_turn(owner_id))
+            origin_message_id = self._turn_origin_native_message_id(owner_id)
             if owner["state"] == "starting":
                 terminal = self._terminalize_durable_turn(
                     owner_id,
@@ -8162,6 +8202,9 @@ class SessionTurnManager:
                 )
             if terminal.get("changed"):
                 released_restored.add(str(owner["session_id"]))
+                # Starting or active, the refresh retired this conversation's input.
+                if not owned_by_run and self.controller is not None:
+                    self._notify_backend_refresh(str(owner["session_id"]), origin_message_id, owner_id, backend)
         for session_id in released_restored:
             if backend in self._draining_backends:
                 self._deferred_restart_sessions.setdefault(backend, set()).add(session_id)
@@ -8174,6 +8217,51 @@ class SessionTurnManager:
                 backend,
             )
         return released
+
+    def _turn_outcome_decided(self, turn: Turn) -> bool:
+        """Whether a Stop or a delivered result already decided this live Turn.
+
+        The runner can still be finishing cleanup after its result released the
+        waiter, so the canceller's own cause is not the only record to consult.
+        """
+
+        if turn.cancel_settled_by is not None:
+            return True
+        get_sink = getattr(self.controller, "get_turn_sink", None)
+        if callable(get_sink):
+            sink = get_sink(resolve_turn_sink_key(self.controller, turn.context))
+            if isinstance(sink, dict) and sink.get("settled_by"):
+                return True
+        if turn.logical_turn_id and self._durable_schema_available():
+            with self._sqlite_engine().connect() as conn:
+                row = delivery_store.get_turn(conn, turn.logical_turn_id)
+            if row is not None and row.get("state") == "terminal":
+                return True
+        return False
+
+    def _notify_backend_refresh(
+        self,
+        session_id: str,
+        origin_native_message_id: str,
+        turn_id: str,
+        backend: str,
+        *,
+        context: "MessageContext | None" = None,
+    ) -> None:
+        # Off the teardown's path: a slow platform send must not hold the
+        # runtime refresh that is waiting on this release. A send that fails is
+        # held and retried like a service-restart report.
+        asyncio.create_task(
+            self._report_interrupted_turn(
+                session_id,
+                origin_native_message_id,
+                turn_id,
+                backend,
+                message_key="turn.interrupted.backendRefresh",
+                context=context,
+            ),
+            name=f"backend-refresh-notice:{session_id}",
+        )
 
     def fail_restored_backend_turn(
         self,

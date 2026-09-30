@@ -6659,9 +6659,18 @@ class SQLiteBackgroundTaskStore:
         *,
         terminal_status: Optional[str] = None,
         error: Optional[str] = None,
+        interrupt_reason: Optional[str] = None,
+        cancellation_error: Optional[str] = None,
         updated_at: Optional[str] = None,
     ) -> bool:
-        """Apply one stored terminal intent after owned Activities become terminal."""
+        """Apply one stored terminal intent after owned Activities become terminal.
+
+        ``interrupt_reason`` names the infrastructure event that ended the owning
+        Activity. It is recorded only when ``error`` is the Run's explanation, so
+        an earlier deferred failure keeps its own cause. A cancellation that wins
+        the race settles the Run as the user's stop, with ``cancellation_error``,
+        whatever was recorded before it.
+        """
 
         now = updated_at or _utc_now_iso()
         row_to_publish = None
@@ -6783,6 +6792,16 @@ class SQLiteBackgroundTaskStore:
                     "result_payload_json": _json_dumps(result_payload),
                 }
                 effective_error = deferred_error if deferred_error is not None else error
+                effective_reason = None
+                if interrupt_reason:
+                    if status == "canceled":
+                        # The user's cancellation won: it is the Run's outcome
+                        # whatever failure was recorded before it.
+                        effective_reason = "stopped"
+                        if cancellation_error is not None:
+                            effective_error = cancellation_error
+                    elif deferred_error is None:
+                        effective_reason = interrupt_reason
                 if effective_error is not None:
                     values["error"] = str(effective_error)
                 if deferred_result_text is not None:
@@ -6796,7 +6815,9 @@ class SQLiteBackgroundTaskStore:
                     parent_run_id=row["parent_run_id"],
                     row_metadata_json=row["metadata_json"],
                     extra_metadata=(
-                        notice_metadata
+                        {**(notice_metadata or {}), "interrupt_reason": effective_reason}
+                        if effective_reason
+                        else notice_metadata
                     ),
                     now=now,
                 )
