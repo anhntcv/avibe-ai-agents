@@ -62,6 +62,10 @@ SERVICE_NAME = "avibe-regression.service"
 UI_NON_SOURCE_DIRS = ("node_modules", "dist", ".vite")
 INTERNAL_DISPATCH_SOCKET = "/tmp/vibe_remote/dispatch.sock"
 DEFAULT_IMAGE = "avibe-regression-base-current"
+# Target projects are created with `features.images=false`, so they read images
+# from Incus's `default` project. The base image is built and published there,
+# never in whatever project the client happens to have selected.
+IMAGE_STORE_PROJECT = "default"
 DEFAULT_BASE_SOURCE_IMAGE = "images:ubuntu/24.04/cloud"
 DEFAULT_NETWORK = "incusbr0"
 DEFAULT_STORAGE_POOL = "default"
@@ -1349,6 +1353,11 @@ def regression_service_unit() -> str:
     ).rstrip()
 
 
+def cloud_init_wait_command() -> str:
+    """Wait for first boot, which brings up the network, before provisioning a new instance."""
+    return "if command -v cloud-init >/dev/null 2>&1; then cloud-init status --wait || true; fi"
+
+
 def prepare_service_directories_command() -> str:
     """Establish writable roots without visiting existing runtime contents."""
     directories = shlex.join((SERVICE_HOME, "/opt/avibe", SOURCE_DIR, VENV_DIR, METADATA_DIR, AVIBE_HOME))
@@ -1587,7 +1596,7 @@ def ensure_project_and_instance(
         root_exec(
             target,
             (
-                "if command -v cloud-init >/dev/null 2>&1; then cloud-init status --wait || true; fi; "
+                f"{cloud_init_wait_command()}; "
                 f"{prepare_service_directories_command()} && "
                 f"ln -sfn {AVIBE_HOME} {LEGACY_HOME} && "
                 "systemctl daemon-reload"
@@ -2547,7 +2556,8 @@ def cmd_build_base(args: argparse.Namespace) -> int:
 
 def build_base_image(args: argparse.Namespace) -> int:
     runner = Runner(dry_run=args.dry_run)
-    runner.run(incus("delete", remote_ref(args.remote, args.temp_instance), "--force"), check=False)
+    project = IMAGE_STORE_PROJECT
+    runner.run(incus("delete", remote_ref(args.remote, args.temp_instance), "--force", project=project), check=False)
     runner.run(
         incus(
             "launch",
@@ -2557,6 +2567,7 @@ def build_base_image(args: argparse.Namespace) -> int:
             args.storage_pool,
             "--network",
             args.network,
+            project=project,
         )
     )
     runner.run(
@@ -2567,8 +2578,10 @@ def build_base_image(args: argparse.Namespace) -> int:
             "bash",
             "-lc",
             textwrap.dedent(
-                """\
+                f"""\
                 set -euo pipefail
+                # `incus launch` returns before first boot has brought up the network.
+                {cloud_init_wait_command()}
                 apt-get update
                 apt-get install -y bash ca-certificates curl git build-essential python3 python3-pip python3-venv rsync sudo tmux
                 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
@@ -2605,6 +2618,7 @@ def build_base_image(args: argparse.Namespace) -> int:
                 npm --version
                 """
             ),
+            project=project,
         )
     )
     runner.run(
@@ -2615,16 +2629,17 @@ def build_base_image(args: argparse.Namespace) -> int:
             "bash",
             "-lc",
             "cloud-init clean --logs || true",
+            project=project,
         )
     )
-    runner.run(incus("stop", remote_ref(args.remote, args.temp_instance), "--force"), check=False)
-    runner.run(incus("image", "delete", remote_ref(args.remote, args.image)), check=False)
-    publish_command = incus("publish", remote_ref(args.remote, args.temp_instance))
+    runner.run(incus("stop", remote_ref(args.remote, args.temp_instance), "--force", project=project), check=False)
+    runner.run(incus("image", "delete", remote_ref(args.remote, args.image), project=project), check=False)
+    publish_command = incus("publish", remote_ref(args.remote, args.temp_instance), project=project)
     if args.remote:
         publish_command.append(remote_ref(args.remote))
     publish_command.extend(["--alias", args.image])
     runner.run(publish_command)
-    runner.run(incus("delete", remote_ref(args.remote, args.temp_instance), "--force"))
+    runner.run(incus("delete", remote_ref(args.remote, args.temp_instance), "--force", project=project))
     return 0
 
 
