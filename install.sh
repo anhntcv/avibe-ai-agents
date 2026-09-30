@@ -23,6 +23,11 @@ VIBE_TOOL_BIN_DIR=""
 # shell happens to have. Upgrades keep every other managed launcher in step.
 ROOT_TOOL_BIN_DIR="/usr/local/bin"
 VIBE_CANDIDATE_BIN_PATH=""
+# uv 0.10.8 and later fetch managed Python from Astral's CDN and fall back to
+# GitHub; earlier uv fetches it from GitHub only. uv_python_install_mirror
+# gives earlier uv the CDN for the install step unless the user chose a source.
+ASTRAL_PYTHON_INSTALL_MIRROR="https://releases.astral.sh/github/python-build-standalone/releases/download"
+UV_INSTALL_PYTHON_MIRROR=""
 LAUNCH_AFTER_INSTALL=""
 AVIBE_LAUNCHED=""
 ORIGINAL_PATH="$PATH"
@@ -320,6 +325,37 @@ uv_is_native_for_host() {
     uv_binary_is_acceptable "$uv_path"
 }
 
+# Print the Python download mirror the install step should give uv, if any.
+# Newer uv is left alone: an explicit mirror turns its GitHub fallback off.
+uv_python_install_mirror() {
+    if [ -n "${UV_PYTHON_INSTALL_MIRROR+set}" ] || [ -n "${UV_PYTHON_DOWNLOADS_JSON_URL+set}" ]; then
+        return 0
+    fi
+
+    local version major minor patch_extra
+    version="$(uv --version 2>/dev/null || true)"
+    version="${version#uv }"
+    IFS='.' read -r major minor patch_extra <<EOF
+${version%% *}
+EOF
+    local patch="${patch_extra%%[^0-9]*}"
+    case "$major.$minor.$patch" in
+        *[!0-9.]*|.*|*..*|*.) return 0 ;;
+    esac
+    if [ "$major" -ne 0 ] || [ "$minor" -gt 10 ] || { [ "$minor" -eq 10 ] && [ "$patch" -ge 8 ]; }; then
+        return 0
+    fi
+
+    # uv resolves its own config files, so a Python source the user chose there
+    # is kept. A config uv cannot load keeps uv's default too.
+    local settings
+    settings="$(uv tool install --show-settings "$PACKAGE_NAME" 2>/dev/null)" || return 0
+    case "$settings" in
+        *"python_install_mirror: Some("*|*"python_downloads_json_url: Some("*) return 0 ;;
+    esac
+    printf '%s\n' "$ASTRAL_PYTHON_INSTALL_MIRROR"
+}
+
 node_version_parts() {
     local version=""
     version="$(node --version 2>/dev/null || true)"
@@ -498,7 +534,8 @@ uv_tool_install() {
     fi
 
     # Suppress package-manager progress only, not activation/retention diagnostics.
-    if UV_TOOL_DIR="$generation_tools" UV_TOOL_BIN_DIR="$generation_bin" uv tool install "$@" 2>/dev/null; then
+    if env ${UV_INSTALL_PYTHON_MIRROR:+"UV_PYTHON_INSTALL_MIRROR=$UV_INSTALL_PYTHON_MIRROR"} \
+        UV_TOOL_DIR="$generation_tools" UV_TOOL_BIN_DIR="$generation_bin" uv tool install "$@" 2>/dev/null; then
         VIBE_CANDIDATE_BIN_PATH="$generation_bin/vibe"
         if [ ! -x "$VIBE_CANDIDATE_BIN_PATH" ]; then
             warn "uv completed but the candidate vibe launcher was not created"
@@ -671,15 +708,39 @@ install_vibe() {
         warn "Could not find a writable directory in PATH; you may need a new shell before 'vibe' is available"
     fi
 
-    if [ -n "$install_package_spec" ]; then
-        if install_package_candidate "$install_package_spec"; then
-            success "avibe-os installed successfully (from custom package spec)"
+    UV_INSTALL_PYTHON_MIRROR="$(uv_python_install_mirror)"
+    if [ -n "$UV_INSTALL_PYTHON_MIRROR" ]; then
+        info "This uv downloads Python from GitHub; using Astral's CDN for any Python download instead"
+    fi
+
+    if install_vibe_from_sources "$install_package_spec"; then
+        return 0
+    fi
+    # The mirror replaces uv's GitHub source instead of adding one, so when no
+    # package source worked through it, try them all once more without it.
+    if [ -n "$UV_INSTALL_PYTHON_MIRROR" ]; then
+        UV_INSTALL_PYTHON_MIRROR=""
+        info "Retrying without Astral's CDN for the Python download..."
+        if install_vibe_from_sources "$install_package_spec"; then
             return 0
         fi
+    fi
 
+    if [ -n "$install_package_spec" ]; then
         error "Failed to install avibe-os from custom package spec: $install_package_spec"
     fi
-    
+    error "Failed to install avibe-os from all sources"
+}
+
+install_vibe_from_sources() {
+    local install_package_spec="$1"
+
+    if [ -n "$install_package_spec" ]; then
+        install_package_candidate "$install_package_spec" || return 1
+        success "avibe-os installed successfully (from custom package spec)"
+        return 0
+    fi
+
     # uv tool install will auto-download Python if not available
     # --force: reinstall even if already installed
     # --refresh: refresh package cache to get latest version
@@ -691,7 +752,7 @@ install_vibe() {
     elif install_package_candidate "git+https://github.com/${REPO}.git"; then
         success "avibe-os installed successfully (from GitHub)"
     else
-        error "Failed to install avibe-os from all sources"
+        return 1
     fi
 }
 

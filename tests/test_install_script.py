@@ -80,6 +80,24 @@ def _write_fake_uv(path: Path, uv_log: Path) -> None:
         #!/usr/bin/env bash
         set -euo pipefail
 
+        if [ "$1" = "--version" ] && [ -n "${{VIBE_TEST_UV_VERSION:-}}" ]; then
+            echo "$VIBE_TEST_UV_VERSION"
+            exit 0
+        fi
+        if [[ " $* " == *" --show-settings "* ]]; then
+            if [ "${{VIBE_TEST_UV_SETTINGS_FAIL:-}}" = "1" ]; then
+                exit 2
+            fi
+            for setting in python_install_mirror python_downloads_json_url; do
+                if [ "${{VIBE_TEST_UV_CONFIGURED_SOURCE:-}}" = "$setting" ]; then
+                    printf '    %s: Some(\\n        "https://mirror.example.test/python",\\n    ),\\n' "$setting"
+                else
+                    printf '    %s: None,\\n' "$setting"
+                fi
+            done
+            exit 0
+        fi
+
         printf '%s' "${{UV_TOOL_BIN_DIR:-}}" > "{uv_log}"
         printf '%s' "${{UV_TOOL_DIR:-}}" > "{uv_log}.tools"
 
@@ -89,6 +107,13 @@ def _write_fake_uv(path: Path, uv_log: Path) -> None:
         fi
 
         if [ "$1" != "tool" ] || [ "$2" != "install" ]; then
+            exit 1
+        fi
+        printf '%s\\n' "${{UV_PYTHON_INSTALL_MIRROR-<unset>}}" >> "{uv_log}.python-mirror"
+        if [ "${{VIBE_TEST_UV_FAIL_WITH_PYTHON_MIRROR:-}}" = "1" ] && [ -n "${{UV_PYTHON_INSTALL_MIRROR+set}}" ]; then
+            exit 1
+        fi
+        if [ "${{VIBE_TEST_UV_FAIL_WITHOUT_INDEX_URL:-}}" = "1" ] && [[ " $* " != *" --index-url "* ]]; then
             exit 1
         fi
 
@@ -368,6 +393,66 @@ def test_install_script_keeps_vibe_available_on_current_path(tmp_path):
     assert version_result.returncode == 0, version_result.stdout + version_result.stderr
     assert "avibe-os 9.9.9" in version_result.stdout
     assert uv_log.read_text(encoding="utf-8")
+
+
+ASTRAL_PYTHON_INSTALL_MIRROR = "https://releases.astral.sh/github/python-build-standalone/releases/download"
+
+
+@pytest.mark.parametrize(
+    ("uv_version", "env_overrides", "expected_mirrors"),
+    [
+        ("uv 0.10.7 (8e2c9a1 2026-03-02)", {}, [ASTRAL_PYTHON_INSTALL_MIRROR]),
+        ("uv 0.10.8", {}, ["<unset>"]),
+        (
+            "uv 0.9.8",
+            {"UV_PYTHON_INSTALL_MIRROR": "https://mirror.example.test/python"},
+            ["https://mirror.example.test/python"],
+        ),
+        ("uv 0.9.8", {"UV_PYTHON_DOWNLOADS_JSON_URL": "https://mirror.example.test/downloads.json"}, ["<unset>"]),
+        ("uv 0.9.8", {"VIBE_TEST_UV_CONFIGURED_SOURCE": "python_install_mirror"}, ["<unset>"]),
+        ("uv 0.9.8", {"VIBE_TEST_UV_CONFIGURED_SOURCE": "python_downloads_json_url"}, ["<unset>"]),
+        ("uv 0.9.8", {"VIBE_TEST_UV_SETTINGS_FAIL": "1"}, ["<unset>"]),
+        (
+            "uv 0.9.8",
+            {"VIBE_TEST_UV_FAIL_WITH_PYTHON_MIRROR": "1"},
+            [ASTRAL_PYTHON_INSTALL_MIRROR] * 3 + ["<unset>"],
+        ),
+        ("uv 0.9.8", {"VIBE_TEST_UV_FAIL_WITHOUT_INDEX_URL": "1"}, [ASTRAL_PYTHON_INSTALL_MIRROR] * 2),
+    ],
+    ids=[
+        "uv-without-cdn",
+        "uv-with-cdn",
+        "user-env-mirror",
+        "user-env-downloads-json",
+        "uv-config-mirror",
+        "uv-config-downloads-json",
+        "uv-config-unreadable",
+        "cdn-down-retries-every-source-without-it",
+        "pypi-down-keeps-cdn-for-tsinghua",
+    ],
+)
+def test_install_script_gives_uv_without_a_python_cdn_the_astral_mirror(
+    tmp_path, uv_version, env_overrides, expected_mirrors
+):
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    uv_log = tmp_path / "uv-tool-bin-dir.txt"
+    _write_fake_uv(path_dir / "uv", uv_log)
+
+    env = os.environ.copy()
+    for name in ("UV_PYTHON_INSTALL_MIRROR", "UV_PYTHON_DOWNLOADS_JSON_URL"):
+        env.pop(name, None)
+    env["HOME"] = str(home_dir)
+    env["PATH"] = os.pathsep.join([str(path_dir), "/usr/bin", "/bin"])
+    env["VIBE_TEST_UV_VERSION"] = uv_version
+    env.update(env_overrides)
+
+    install_result = _install(env)
+
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+    assert Path(f"{uv_log}.python-mirror").read_text(encoding="utf-8").splitlines() == expected_mirrors
 
 
 def test_install_script_canonicalizes_relative_avibe_home(tmp_path):
