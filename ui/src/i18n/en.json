@@ -4575,6 +4575,7 @@
       "model": "Model",
       "effort": "Effort",
       "newAgent": "New agent",
+      "addModel": "Add model",
       "noModels": "No models found",
       "searchModels": "Search models",
       "noModelMatch": "No matching models",

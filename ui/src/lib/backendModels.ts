@@ -1,6 +1,13 @@
+import { useEffect, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+
 import { routeableCatalogModelIds } from '../components/settings/models/backendCatalog';
+import { modelHubCatalogPath } from '../components/settings/models/modelHubRoutes';
 import type { AgentSupply } from '../components/settings/models/types';
-import { ApiError, type ApiContextType } from '../context/ApiContext';
+import { ApiError, useApi, type ApiContextType } from '../context/ApiContext';
+import { useInstanceAuthorization } from '../context/InstanceAuthorizationContext';
+import { useRouteSurfaceActive } from './routeSurfaceActivity';
+import { settingsOverlayContinuationState } from './settingsOverlay';
 
 export interface BackendModels {
   /** Selectable model identifiers for the backend. */
@@ -26,8 +33,11 @@ export function modelOptionLabel(model: string, labels?: Record<string, string>)
 // the native fallback; an explicitly empty catalog remains an empty menu.
 type PickerAgentCatalog = Pick<AgentSupply, 'backend' | 'mode' | 'catalog_models'>;
 
+const isHubAgent = (agent: PickerAgentCatalog | null, backend: string): agent is PickerAgentCatalog =>
+  agent !== null && agent.backend === backend && agent.mode === 'hub';
+
 const hubCatalogModels = (agent: PickerAgentCatalog | null, backend: string): BackendModels | null => {
-  if (!agent || agent.backend !== backend || agent.mode !== 'hub') return null;
+  if (!isHubAgent(agent, backend)) return null;
   const catalog = agent.catalog_models ?? null;
   if (!catalog) return null;
   // A backend-owned selector such as Claude Code's Default is not routeable.
@@ -139,6 +149,52 @@ export async function fetchBackendModels(
   return { models: [] };
 }
 
+/**
+ * A model picker's "Add model" exit: opens this backend's catalog in the Model
+ * Hub, or is null when the picker shows none. Only a Model Hub backend has a
+ * catalog to add to, and the Model Hub is an Instance Owner surface that sends
+ * anyone else home.
+ *
+ * The one owner of that answer. It comes from a read made while the surface is
+ * showing and is dropped the moment it may be stale — the surface is covered
+ * (Settings may switch the backend to Direct), the backend changes, or `enabled`
+ * turns off — so no exit outlives the read that justified it, and a failed read
+ * shows none. `enabled` lets a picker read only while its menu is open.
+ *
+ * The exit is a detour to come back from, so it records where it starts, on a
+ * phone too, where Settings otherwise keeps only the Workbench home mounted
+ * behind it. From a picker already inside Settings it keeps the visit's origin.
+ */
+export function useAddModelExit(backend: string, enabled = true): (() => void) | null {
+  const api = useApi();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { capabilities } = useInstanceAuthorization();
+  const surfaceActive = useRouteSurfaceActive();
+  const readable = enabled && surfaceActive && Boolean(backend) && capabilities.can_manage_instance;
+  const [hubBackend, setHubBackend] = useState<string | null>(null);
+  useEffect(() => {
+    if (!readable) return;
+    let cancelled = false;
+    void api.readModelHubAgentCatalogForModelPicker(backend).then((agent) => {
+      if (!cancelled && isHubAgent(agent, backend)) setHubBackend(backend);
+    });
+    return () => {
+      cancelled = true;
+      setHubBackend(null);
+    };
+  }, [api, backend, readable]);
+  if (!readable || hubBackend !== backend) return null;
+  return () => navigate(modelHubCatalogPath(backend), { state: settingsOverlayContinuationState(location) });
+}
+
+/**
+ * Read a backend's model list, then re-read while a remote-catalog refresh is
+ * pending. A caller whose surface stays mounted under Settings treats a Settings
+ * visit as invalidating what it read: it drops those rows when
+ * `useRouteSurfaceActive()` turns false and reads again when it turns true, since
+ * the Model Hub there edits the list and may change which catalog supplies it.
+ */
 export function loadBackendModelsWithRefresh(
   api: ApiContextType,
   backend: string,

@@ -48,8 +48,9 @@ import { Textarea } from '../ui/textarea';
 import { EditorDialog } from '../ui/editor-dialog';
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
 import { onPageReactivated } from '../../lib/pageActivity';
+import { useRouteSurfaceActive } from '../../lib/routeSurfaceActivity';
 import { estimateTokens } from '../../lib/tokenEstimate';
-import { loadBackendModelsWithRefresh, modelOptionLabel } from '../../lib/backendModels';
+import { loadBackendModelsWithRefresh, modelOptionLabel, useAddModelExit } from '../../lib/backendModels';
 import { resolveEffortOptions } from '../../lib/effortOptions';
 import { WorkbenchPageHeader } from './WorkbenchPageHeader';
 import { CapabilityTabs } from './CapabilityTabs';
@@ -2008,6 +2009,8 @@ const AgentDetailPanel: React.FC<DetailProps> = ({ agent, isDefault, canEdit, ca
   const activeModelCatalog = modelCatalogs[agent.backend];
   const modelOptions = activeModelCatalog?.modelOptions ?? [];
   const reasoningOptions = activeModelCatalog?.reasoningOptions ?? {};
+  const openAddModel = useAddModelExit(agent.backend, canEdit);
+  const surfaceActive = useRouteSurfaceActive();
 
   useEffect(() => {
     const previous = serverSnapshotRef.current;
@@ -2065,9 +2068,12 @@ const AgentDetailPanel: React.FC<DetailProps> = ({ agent, isDefault, canEdit, ca
 
   // Load model catalog for the agent's backend so the Combobox can offer
   // suggestions. Keeps `allowCustomValue` so users can type a model the
-  // backend doesn't know about yet (e.g. a freshly-released preview).
+  // backend doesn't know about yet (e.g. a freshly-released preview). Read
+  // again when Settings uncovers the page: the Model Hub there edits the list,
+  // so the rows read before the visit go when Settings covers it.
   useEffect(() => {
-    return loadBackendModelsWithRefresh(
+    if (!surfaceActive) return;
+    const cancel = loadBackendModelsWithRefresh(
       api,
       agent.backend,
       ({ models, modelLabels, reasoningOptions: opts }) => {
@@ -2086,7 +2092,15 @@ const AgentDetailPanel: React.FC<DetailProps> = ({ agent, isDefault, canEdit, ca
         }));
       },
     );
-  }, [agent.backend, api]);
+    return () => {
+      cancel();
+      setModelCatalogs((current) => {
+        const next = { ...current };
+        delete next[agent.backend];
+        return next;
+      });
+    };
+  }, [agent.backend, api, surfaceActive]);
 
   const lockHint = system
     ? t('agents.detail.systemLocked')
@@ -2096,6 +2110,10 @@ const AgentDetailPanel: React.FC<DetailProps> = ({ agent, isDefault, canEdit, ca
   const systemPromptTokens = estimateTokens(systemPrompt);
   // Effort options follow the backend + selected model when the catalog provides them.
   const effortOptions = resolveEffortOptions(agent.backend, model, reasoningOptions);
+  // The efforts shown before the catalog answers are the backend's fallback
+  // ladder, which may hold one the model rejects; they stay visible but cannot
+  // be picked until the read (or its failure) lands.
+  const effortsAnswered = activeModelCatalog !== undefined;
   const markFieldEdit = (field: keyof typeof fieldRevisionRef.current) => {
     fieldRevisionRef.current[field] += 1;
     return fieldRevisionRef.current[field];
@@ -2402,6 +2420,7 @@ const AgentDetailPanel: React.FC<DetailProps> = ({ agent, isDefault, canEdit, ca
             placeholder={t('agents.detail.modelPlaceholder')}
             emptyText={t('agents.detail.modelEmpty')}
             allowCustomValue
+            footerAction={openAddModel ? { label: t('chat.picker.addModel'), onSelect: openAddModel } : undefined}
           />
         )}
       </Field>
@@ -2421,7 +2440,7 @@ const AgentDetailPanel: React.FC<DetailProps> = ({ agent, isDefault, canEdit, ca
               <button
                 key={opt}
                 type="button"
-                disabled={!canEdit}
+                disabled={!canEdit || !effortsAnswered}
                 title={canEdit ? undefined : t('agents.remoteReadOnlyHint')}
                 onClick={() => {
                   markFieldEdit('effort');

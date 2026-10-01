@@ -2,11 +2,15 @@
 
 import { useState } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 
 import type { VibeAgentBrief } from '../../context/ApiContext';
+import { InstanceAuthorizationContext } from '../../context/InstanceAuthorizationContext';
+import { RouteSurfaceActiveContext } from '../../lib/routeSurfaceActivity';
+import { capabilitiesFor } from '../../lib/testing/instanceRoleCapabilities';
+import type { InstanceRole } from '../../lib/sessionInfo';
 import { AgentRoutePicker } from './AgentRoutePicker';
 import type { AgentRoutePatch, AgentRouteValue } from './AgentRoutePicker';
 
@@ -14,15 +18,26 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
+// One client for every render, as the real context provides: the picker's
+// catalog read keys on it, so a fresh object per render would re-read on its own.
+// The Hub read answers per test; `useAddModelPath` owns what it means.
+let hubMode: 'hub' | 'direct' = 'direct';
+const API = {
+  readModelHubAgentCatalogForModelPicker: (backend: string) => Promise.resolve({ backend, mode: hubMode }),
+};
 vi.mock('../../context/ApiContext', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../context/ApiContext')>()),
-  useApi: () => ({}),
+  useApi: () => API,
 }));
 
 // What the catalog answers for this render. A Hub catalog states one entry per
 // model, so a test can say "this model has no efforts" the same way the server
 // does — and an empty default keeps the backend fallback in play.
 let catalogReasoning: Record<string, { value: string; label: string }[]> = {};
+// How many catalog reads were made, and whether the next ones wait to be answered.
+let catalogReads = 0;
+let deferReads = false;
+const pendingReads: (() => void)[] = [];
 
 // The model column is fetched per backend; serve it synchronously so the test is
 // about the route state, not about the catalog request.
@@ -38,12 +53,15 @@ vi.mock('../../lib/backendModels', async (importOriginal) => ({
       catalogRefreshPending: boolean;
     }) => void,
   ) => {
-    onLoaded({
+    catalogReads += 1;
+    const answer = () => onLoaded({
       models: ['sonnet', 'opus'],
       modelLabels: {},
       reasoningOptions: catalogReasoning,
       catalogRefreshPending: false,
     });
+    if (deferReads) pendingReads.push(answer);
+    else answer();
     return () => {};
   },
 }));
@@ -120,10 +138,111 @@ const openMenu = async (user: ReturnType<typeof userEvent.setup>) => {
   await screen.findByText('chat.picker.model');
 };
 
+const LocationProbe = () => {
+  const location = useLocation();
+  return <output data-testid="location">{`${location.pathname}${location.search}`}</output>;
+};
+
+// A picker on a surface Settings can cover, seen by a viewer holding `role`.
+const HubPicker: React.FC<{
+  role: InstanceRole;
+  surfaceActive?: boolean;
+  onNavigateAway?: () => void;
+}> = ({ role, surfaceActive = true, onNavigateAway }) => (
+  <InstanceAuthorizationContext.Provider
+    value={{ remote: false, instanceKind: null, instanceRole: role, capabilities: capabilitiesFor(role) }}
+  >
+    <RouteSurfaceActiveContext.Provider value={surfaceActive}>
+      <MemoryRouter>
+        <AgentRoutePicker value={CLAUDE_ROUTE} agents={AGENTS} onChange={() => {}} onNavigateAway={onNavigateAway} />
+        <LocationProbe />
+      </MemoryRouter>
+    </RouteSurfaceActiveContext.Provider>
+  </InstanceAuthorizationContext.Provider>
+);
+
 describe('AgentRoutePicker', () => {
   afterEach(() => {
     cleanup();
     catalogReasoning = {};
+    hubMode = 'direct';
+    catalogReads = 0;
+    deferReads = false;
+    pendingReads.length = 0;
+  });
+
+  it("ends a Hub backend's model list with an exit to that backend's catalog in the Model Hub", async () => {
+    hubMode = 'hub';
+    const user = userEvent.setup();
+    const onNavigateAway = vi.fn();
+    render(<HubPicker role="owner" onNavigateAway={onNavigateAway} />);
+    await openMenu(user);
+
+    const addModel = await screen.findByRole('button', { name: 'chat.picker.addModel' });
+    const lastModel = screen.getByRole('button', { name: 'opus' });
+    expect(lastModel.compareDocumentPosition(addModel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await user.click(addModel);
+
+    expect(screen.getByTestId('location').textContent).toBe('/settings/models?manage=claude');
+    expect(screen.queryByText('chat.picker.model')).toBeNull();
+    // Settings opens over the host, which suspends under it with its draft
+    // instead of being closed the way leaving for /agents closes it.
+    expect(onNavigateAway).not.toHaveBeenCalled();
+  });
+
+  it('reads the model list again once Settings stops covering the surface', async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(<HubPicker role="owner" />);
+    await openMenu(user);
+    await user.keyboard('{Escape}');
+    await openMenu(user);
+    await user.keyboard('{Escape}');
+    // Reopening alone serves the list already read.
+    expect(catalogReads).toBe(1);
+
+    rerender(<HubPicker role="owner" surfaceActive={false} />);
+    rerender(<HubPicker role="owner" />);
+    await openMenu(user);
+
+    // The Model Hub may have changed the list while it was covered.
+    expect(catalogReads).toBe(2);
+  });
+
+  it('offers no row read before a Settings visit while the read after it is in flight', async () => {
+    // The visit may have switched the backend to Direct, where a Hub-only row
+    // is a route that cannot run.
+    const user = userEvent.setup();
+    const { rerender } = render(<HubPicker role="owner" />);
+    await openMenu(user);
+    expect(screen.getByRole('button', { name: 'opus' })).toBeTruthy();
+
+    deferReads = true;
+    rerender(<HubPicker role="owner" surfaceActive={false} />);
+    rerender(<HubPicker role="owner" />);
+
+    expect(screen.queryByRole('button', { name: 'opus' })).toBeNull();
+    expect(screen.getByText('common.loading')).toBeTruthy();
+    // Nor an effort: without the catalog the backend's fallback ladder could
+    // offer one the current model rejects.
+    expect(screen.queryByText('chat.picker.effort')).toBeNull();
+    act(() => pendingReads.shift()!());
+    expect(screen.getByRole('button', { name: 'opus' })).toBeTruthy();
+    expect(screen.getByText('chat.picker.effort')).toBeTruthy();
+  });
+
+  it('reads the list again for a menu left open while Settings covered it', async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(<HubPicker role="owner" />);
+    await openMenu(user);
+    expect(catalogReads).toBe(1);
+
+    // A Settings command opens over the surface without dismissing the menu.
+    rerender(<HubPicker role="owner" surfaceActive={false} />);
+    rerender(<HubPicker role="owner" />);
+
+    expect(screen.getByText('chat.picker.model')).toBeTruthy();
+    expect(catalogReads).toBe(2);
   });
 
   it('highlights the pick while the owner write is still in flight', async () => {

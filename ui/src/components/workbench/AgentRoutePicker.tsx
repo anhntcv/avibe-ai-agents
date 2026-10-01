@@ -6,8 +6,9 @@ import clsx from 'clsx';
 
 import { useApi } from '../../context/ApiContext';
 import type { VibeAgentBrief } from '../../context/ApiContext';
-import { loadBackendModelsWithRefresh, modelOptionLabel } from '../../lib/backendModels';
+import { loadBackendModelsWithRefresh, modelOptionLabel, useAddModelExit } from '../../lib/backendModels';
 import { isEffortSupported, resolveEffortOptions } from '../../lib/effortOptions';
+import { useRouteSurfaceActive } from '../../lib/routeSurfaceActivity';
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
@@ -59,7 +60,9 @@ interface AgentRoutePickerProps {
    *  new-session sheet) so its content isn't aria-hidden/inert by the dialog. */
   modal?: boolean;
   /** Called before navigating to /agents — the create sheet uses it to close
-   *  itself so the destination isn't left behind a focus-trapped modal. */
+   *  itself so the destination isn't left behind a focus-trapped modal. The
+   *  Model Hub exit does not call it: Settings opens over this surface, and a
+   *  host suspends under it with its draft intact, as it does for any visit. */
   onNavigateAway?: () => void;
 }
 
@@ -100,6 +103,7 @@ export const AgentRoutePicker: React.FC<AgentRoutePickerProps> = ({
     Record<string, Record<string, ReasoningOption[]>>
   >({});
   const loadedModelBackendsRef = useRef<Set<string>>(new Set());
+  const surfaceActive = useRouteSurfaceActive();
   const [loadingModels, setLoadingModels] = useState(false);
   // Free-text filter for the model column — long backends (OpenCode) list dozens.
   const [modelQuery, setModelQuery] = useState('');
@@ -186,6 +190,18 @@ export const AgentRoutePicker: React.FC<AgentRoutePickerProps> = ({
     };
   }, []);
 
+  // Settings covers this surface while it is open, and the Model Hub there may
+  // change any backend's list, even which catalog supplies it. Nothing read
+  // before the visit survives it: the return shows loading until a new read
+  // lands, never a row the backend may no longer offer.
+  useEffect(() => {
+    if (surfaceActive) return;
+    loadedModelBackendsRef.current.clear();
+    setModelsByBackend({});
+    setModelLabelsByBackend({});
+    setReasoningByBackend({});
+  }, [surfaceActive]);
+
   const grouped = useMemo(() => {
     const groups: Record<string, VibeAgentBrief[]> = {};
     for (const agent of visibleAgents) {
@@ -195,10 +211,11 @@ export const AgentRoutePicker: React.FC<AgentRoutePickerProps> = ({
   }, [visibleAgents]);
 
   // Fetch the active backend's model list the first time the menu opens for it;
-  // cached per backend so toggling agents doesn't refetch.
+  // cached per backend so toggling agents doesn't refetch. A menu left open
+  // under Settings reads again as it is uncovered.
   useEffect(() => {
     const loadedBackends = loadedModelBackendsRef.current;
-    if (!open || !backend || loadedBackends.has(backend)) return;
+    if (!open || !surfaceActive || !backend || loadedBackends.has(backend)) return;
     loadedBackends.add(backend);
     let reloadOnNextOpen = true;
     setLoadingModels(true);
@@ -215,6 +232,8 @@ export const AgentRoutePicker: React.FC<AgentRoutePickerProps> = ({
       () => {
         loadedBackends.delete(backend);
         setModelsByBackend((prev) => ({ ...prev, [backend]: [] }));
+        // No catalog to consult: the backend's own ladder, as for any unknown model.
+        setReasoningByBackend((prev) => ({ ...prev, [backend]: prev[backend] ?? {} }));
         setLoadingModels(false);
       },
     );
@@ -222,7 +241,7 @@ export const AgentRoutePicker: React.FC<AgentRoutePickerProps> = ({
       cancel();
       if (reloadOnNextOpen) loadedBackends.delete(backend);
     };
-  }, [open, backend, api]);
+  }, [open, surfaceActive, backend, api]);
 
   // Start each open (and every backend switch) from the full, unfiltered list.
   useEffect(() => {
@@ -232,6 +251,7 @@ export const AgentRoutePicker: React.FC<AgentRoutePickerProps> = ({
   const models = modelsByBackend[backend] ?? [];
   const modelLabels = modelLabelsByBackend[backend] ?? {};
   const backendReasoning = reasoningByBackend[backend] ?? EMPTY_REASONING_OPTIONS;
+  const openAddModel = useAddModelExit(backend, open);
   // Show the search field only when the list is long enough to warrant it, so
   // claude/codex (a handful of models) stay uncluttered.
   const showModelSearch = models.length > 8;
@@ -243,9 +263,14 @@ export const AgentRoutePicker: React.FC<AgentRoutePickerProps> = ({
           modelOptionLabel(m, modelLabels).toLowerCase().includes(trimmedQuery),
       )
     : models;
+  // Efforts are a catalog answer too. Until this backend's read has answered
+  // (first open, or the read after a Settings visit dropped the last one), the
+  // fallback ladder could offer an effort the current model rejects, so the
+  // column waits with the model column instead.
+  const catalogAnswered = Object.prototype.hasOwnProperty.call(reasoningByBackend, backend);
   const effortOptions = useMemo(
-    () => resolveEffortOptions(backend, currentModel, backendReasoning),
-    [backend, currentModel, backendReasoning],
+    () => (catalogAnswered ? resolveEffortOptions(backend, currentModel, backendReasoning) : []),
+    [catalogAnswered, backend, currentModel, backendReasoning],
   );
 
   return (
@@ -370,10 +395,8 @@ export const AgentRoutePicker: React.FC<AgentRoutePickerProps> = ({
                 ))}
               </div>
             ))}
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
+            <PickerExitButton
+              label={t('chat.picker.newAgent')}
               onClick={() => {
                 setOpen(false);
                 onNavigateAway?.(); // close the create sheet before leaving, if any
@@ -381,15 +404,14 @@ export const AgentRoutePicker: React.FC<AgentRoutePickerProps> = ({
                 // that tab explicitly instead of resuming the remembered one.
                 navigate('/agents?tab=definitions');
               }}
-              className="mt-1 h-auto w-full justify-start gap-1.5 rounded px-2 py-1.5 text-[11px] font-medium text-cyan-ink hover:bg-cyan/[0.08] hover:text-cyan-ink"
-            >
-              <Plus className="size-3.5" />
-              {t('chat.picker.newAgent')}
-            </Button>
+            />
           </RouteColumn>
 
-          {/* Column 2 — Model (lazy-loaded for the active backend) */}
-          <RouteColumn title={t('chat.picker.model')}>
+          {/* Column 2 — Model (lazy-loaded for the active backend). Its own
+              scroll box on phones too, where the columns stack: the sticky search
+              and Add model rows pin to the nearest scroll box, and a column that
+              never scrolls would leave them at the far ends of a long list. */}
+          <RouteColumn title={t('chat.picker.model')} className="max-h-[45vh]">
             {showModelSearch && (
               <div className="sticky top-0 z-10 -mx-1.5 mb-1 bg-panel px-1.5 pb-1 pt-0.5">
                 <div className="flex items-center gap-1.5 rounded-md border border-border bg-surface-2 px-2 focus-within:border-cyan/50">
@@ -439,6 +461,19 @@ export const AgentRoutePicker: React.FC<AgentRoutePickerProps> = ({
                 </RouteItem>
               ))
             )}
+            {/* Pinned like the search above it: a long model list must not scroll
+                the way to add one out of sight. */}
+            {openAddModel && (
+              <div className="sticky -bottom-1.5 z-10 -mx-1.5 -mb-1.5 border-t border-border bg-panel px-1.5 pb-1.5">
+                <PickerExitButton
+                  label={t('chat.picker.addModel')}
+                  onClick={() => {
+                    setOpen(false);
+                    openAddModel();
+                  }}
+                />
+              </div>
+            )}
           </RouteColumn>
 
           {/* Column 3 — Effort (uses per-model catalog entries when available) */}
@@ -463,11 +498,26 @@ export const AgentRoutePicker: React.FC<AgentRoutePickerProps> = ({
   );
 };
 
-const RouteColumn: React.FC<{ title: string; children: React.ReactNode }> = ({ title, children }) => (
-  <div className="flex min-w-0 flex-col overflow-y-auto p-1.5 sm:max-h-[320px]">
+const RouteColumn: React.FC<{ title: string; className?: string; children: React.ReactNode }> = ({ title, className, children }) => (
+  <div className={clsx('flex min-w-0 flex-col overflow-y-auto p-1.5 sm:max-h-[320px]', className)}>
     <div className="px-2 pb-1 pt-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-muted">{title}</div>
     {children}
   </div>
+);
+
+// The "+ …" row closing a column: it leaves the picker for the page where that
+// column's list is edited.
+const PickerExitButton: React.FC<{ label: string; onClick: () => void }> = ({ label, onClick }) => (
+  <Button
+    type="button"
+    variant="ghost"
+    size="sm"
+    onClick={onClick}
+    className="mt-1 h-auto w-full justify-start gap-1.5 rounded px-2 py-1.5 text-[11px] font-medium text-cyan-ink hover:bg-cyan/[0.08] hover:text-cyan-ink"
+  >
+    <Plus className="size-3.5" />
+    {label}
+  </Button>
 );
 
 // A picker row on the shared Button primitive (variant + className overrides)

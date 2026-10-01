@@ -2,12 +2,13 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 
 import { InstanceAuthorizationContext } from '../../context/InstanceAuthorizationContext';
 import type { VibeAgentBrief, WorkbenchEventHandlers, WorkbenchProject } from '../../context/ApiContext';
 import type { InstanceCapabilities, InstanceRole } from '../../lib/sessionInfo';
 import { OWNER_INSTANCE_CAPABILITIES } from '../../lib/sessionInfo';
+import { RouteSurfaceActiveContext } from '../../lib/routeSurfaceActivity';
 import { capabilitiesFor } from '../../lib/testing/instanceRoleCapabilities';
 import { AgentsPage } from './AgentsPage';
 
@@ -22,6 +23,7 @@ type FakeApi = {
   listProjects: ReturnType<typeof vi.fn>;
   createSession: ReturnType<typeof vi.fn>;
   connectWorkbenchEvents: ReturnType<typeof vi.fn>;
+  readModelHubAgentCatalogForModelPicker: ReturnType<typeof vi.fn>;
 };
 
 const apiRef = vi.hoisted(() => ({ current: null as FakeApi | null }));
@@ -49,10 +51,17 @@ type FakeModelCatalog = {
   reasoningOptions?: Record<string, { value: string; label: string }[]>;
 };
 let modelCatalog: FakeModelCatalog = { models: [] };
+let modelCatalogReads = 0;
+let deferModelReads = false;
+const pendingModelReads: (() => void)[] = [];
 
-vi.mock('../../lib/backendModels', async () => ({
+vi.mock('../../lib/backendModels', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../lib/backendModels')>()),
   loadBackendModelsWithRefresh: (_api: unknown, _backend: string, onLoaded: (payload: FakeModelCatalog) => void) => {
-    onLoaded(modelCatalog);
+    modelCatalogReads += 1;
+    const catalog = modelCatalog;
+    if (deferModelReads) pendingModelReads.push(() => onLoaded(catalog));
+    else onLoaded(catalog);
     return () => {};
   },
 }));
@@ -128,6 +137,8 @@ function makeApi(
       handlers = next;
       return vi.fn();
     }),
+    // No Model Hub record: the model field offers no Add model exit.
+    readModelHubAgentCatalogForModelPicker: vi.fn().mockResolvedValue(null),
   };
 }
 
@@ -182,6 +193,9 @@ afterEach(() => {
   handlers = null;
   showToast.mockReset();
   modelCatalog = { models: [] };
+  modelCatalogReads = 0;
+  deferModelReads = false;
+  pendingModelReads.length = 0;
 });
 
 describe('AgentsPage load requests follow the rank that can serve them', () => {
@@ -1483,6 +1497,52 @@ describe('AgentsPage reconnect reconciliation', () => {
     // heading reads as a control that failed to load.
     expect(screen.queryByRole('button', { name: 'medium', exact: true })).toBeNull();
     expect(screen.queryByText('agents.detail.effort')).toBeNull();
+  });
+
+  it("offers the Model Hub from a Hub backend's model list, and reads the list again on return", async () => {
+    modelCatalog = { models: ['gpt-hub'] };
+    const initial = brief('agent-a', 'description');
+    const api = makeApi(vi.fn().mockResolvedValue(listResult(initial)), vi.fn().mockResolvedValue(fullAgent(initial, 'prompt')));
+    api.readModelHubAgentCatalogForModelPicker.mockResolvedValue({ backend: 'codex', mode: 'hub' });
+    apiRef.current = api;
+    const LocationProbe = () => {
+      const location = useLocation();
+      return <output data-testid="location">{`${location.pathname}${location.search}`}</output>;
+    };
+    const page = (surfaceActive: boolean) => (
+      <InstanceAuthorizationContext.Provider
+        value={{ remote: false, instanceKind: null, instanceRole: 'owner', capabilities: { ...OWNER_INSTANCE_CAPABILITIES, can_manage_agents: true } }}
+      >
+        <RouteSurfaceActiveContext.Provider value={surfaceActive}>
+          <MemoryRouter initialEntries={['/agents']}>
+            <AgentsPage />
+            <LocationProbe />
+          </MemoryRouter>
+        </RouteSurfaceActiveContext.Provider>
+      </InstanceAuthorizationContext.Provider>
+    );
+    const view = render(page(true));
+    await waitFor(() => expect(screen.getByDisplayValue('description')).toBeTruthy());
+    const reads = modelCatalogReads;
+
+    // Settings covers the page and uncovers it: the Model Hub may have edited the
+    // list, so the rows read before the visit are not offered meanwhile.
+    deferModelReads = true;
+    view.rerender(page(false));
+    view.rerender(page(true));
+    expect(modelCatalogReads).toBe(reads + 1);
+
+    // cmdk scrolls its highlighted row into view; jsdom implements no scrolling.
+    Element.prototype.scrollIntoView = vi.fn();
+    // Neither a model nor an effort read before the visit can be picked meanwhile.
+    expect((screen.getByRole('button', { name: 'medium', exact: true }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('combobox'));
+    expect(screen.queryByRole('option', { name: 'gpt-hub' })).toBeNull();
+    act(() => pendingModelReads.shift()!());
+    expect(screen.getByRole('option', { name: 'gpt-hub' })).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'medium', exact: true, hidden: true }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(await screen.findByText('chat.picker.addModel'));
+    expect(screen.getByTestId('location').textContent).toBe('/settings/models?manage=codex');
   });
 
   it('keeps an unset server effort unset instead of lighting a default', async () => {

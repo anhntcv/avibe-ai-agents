@@ -5,8 +5,9 @@ import clsx from 'clsx';
 
 import { useApi } from '../../context/ApiContext';
 import type { VibeAgentFull } from '../../context/ApiContext';
-import { loadBackendModelsWithRefresh, modelOptionLabel } from '../../lib/backendModels';
+import { loadBackendModelsWithRefresh, modelOptionLabel, useAddModelExit } from '../../lib/backendModels';
 import { resolveEffortOptions } from '../../lib/effortOptions';
+import { useRouteSurfaceActive } from '../../lib/routeSurfaceActivity';
 import { estimateTokens } from '../../lib/tokenEstimate';
 import { Combobox } from '../ui/combobox';
 import type { ComboboxOption } from '../ui/combobox';
@@ -60,7 +61,13 @@ export const NewAgentDialog: React.FC<NewAgentDialogProps> = ({ open, onClose, o
   const [error, setError] = useState<string | null>(null);
   const [modelOptions, setModelOptions] = useState<ComboboxOption[]>([]);
   const [reasoningOptions, setReasoningOptions] = useState<Record<string, { value: string; label: string }[]>>({});
+  // Whether this backend's catalog has answered since it was last invalidated
+  // (a backend switch, or a Settings visit). Until it has, nothing the dialog
+  // offers is confirmed against it.
+  const [catalogAnswered, setCatalogAnswered] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
+  const openAddModel = useAddModelExit(backend, open);
+  const surfaceActive = useRouteSurfaceActive();
 
   useEffect(() => {
     if (!open) {
@@ -78,19 +85,35 @@ export const NewAgentDialog: React.FC<NewAgentDialogProps> = ({ open, onClose, o
 
   // Reload the model catalog whenever the selected backend changes so
   // the Combobox suggests the right list. allowCustomValue stays on so
-  // freshly-released model IDs can still be typed in.
+  // freshly-released model IDs can still be typed in. The dialog stays open
+  // under Settings, so it reads again once Settings uncovers it, and offers no
+  // row read before the visit meanwhile. The effort options stay so the draft's
+  // chosen effort does not move, but neither an effort nor Create can be
+  // chosen until the new read answers and the effort is checked against it.
   useEffect(() => {
-    if (!open) return;
-    return loadBackendModelsWithRefresh(
+    if (!open || !surfaceActive) return;
+    const cancel = loadBackendModelsWithRefresh(
       api,
       backend,
       ({ models, modelLabels, reasoningOptions: opts }) => {
         setModelOptions(models.map((m) => ({ value: m, label: modelOptionLabel(m, modelLabels) })));
         setReasoningOptions(opts ?? {});
+        setCatalogAnswered(true);
       },
-      () => setModelOptions([]),
+      () => {
+        // No catalog to check against: the backend's own ladder, as for any
+        // unknown model, never the efforts read before the visit.
+        setModelOptions([]);
+        setReasoningOptions({});
+        setCatalogAnswered(true);
+      },
     );
-  }, [backend, open, api]);
+    return () => {
+      cancel();
+      setModelOptions([]);
+      setCatalogAnswered(false);
+    };
+  }, [backend, open, api, surfaceActive]);
 
   const modelComboboxOptions = useMemo(() => modelOptions, [modelOptions]);
   const effortOptions = useMemo(
@@ -120,7 +143,7 @@ export const NewAgentDialog: React.FC<NewAgentDialogProps> = ({ open, onClose, o
 
   if (!open) return null;
 
-  const canSubmit = name.trim().length > 0 && !submitting;
+  const canSubmit = name.trim().length > 0 && !submitting && catalogAnswered;
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -265,6 +288,9 @@ export const NewAgentDialog: React.FC<NewAgentDialogProps> = ({ open, onClose, o
               placeholder={t('agents.detail.modelPlaceholder')}
               emptyText={t('agents.detail.modelEmpty')}
               allowCustomValue
+              // The dialog stays open: Settings hides the page it sits in, and
+              // the form is here again when the user comes back.
+              footerAction={openAddModel ? { label: t('chat.picker.addModel'), onSelect: openAddModel } : undefined}
             />
           </div>
           {effortOptions.length > 0 && (
@@ -281,8 +307,9 @@ export const NewAgentDialog: React.FC<NewAgentDialogProps> = ({ open, onClose, o
                     key={opt}
                     type="button"
                     onClick={() => setEffort(opt)}
+                    disabled={!catalogAnswered}
                     className={clsx(
-                      'truncate rounded px-0.5 py-1.5 text-[11px] capitalize transition',
+                      'truncate rounded px-0.5 py-1.5 text-[11px] capitalize transition disabled:opacity-60',
                       effort === opt ? 'bg-mint-soft font-bold text-mint-ink' : 'font-medium text-muted hover:text-foreground',
                     )}
                   >
