@@ -29,7 +29,7 @@ from core.handlers.model_hub.provenance import (
     PreparedGatewayRoute,
     TurnOutcomeProjectionInput,
     exact_hop_blockers,
-    produce_turn_outcome,
+    is_unlisted_model_outcome,
     render_turn_outcome_copy,
     supply_interruption_reason,
 )
@@ -46,9 +46,11 @@ from core.handlers.model_hub.service import (
     ModelHubService,
     create_default_service,
     project_opencode_public_model,
+    turn_refusal,
 )
 from core.services.settings import load_config_or_default
 from core.handlers.model_hub.turn_gateway import ModelHubTurnGateway
+from core.native_dispatch_phase import mark_prewrite_recovery_required
 from vibe.codex_config import format_toml_basic_string
 from vibe.opencode_config import managed_opencode_runtime_config_content
 
@@ -59,6 +61,9 @@ TurnMode = Literal["direct", "hub"]
 _CONTEXT_LAUNCH_ATTR = "_vibe_model_hub_launch"
 _CONTEXT_MODE_ATTR = "_vibe_model_hub_turn_mode"
 _CONTEXT_FAILURE_RECORDED_ATTR = "_vibe_model_hub_failure_recorded"
+# The durable hold's reason when a turn asks for a model its backend's list
+# does not hold: the same input fails the same way until another model is chosen.
+UNLISTED_MODEL_RETRY_REASON = "model_hub_model_unlisted"
 _NATIVE_QUOTA_RE = re.compile(
     r"(?:quota|usage|credit|billing).{0,32}(?:exhaust|exceed|limit|deplet|insufficient)|"
     r"(?:exhaust|exceed|limit|deplet|insufficient).{0,32}(?:quota|usage|credit|billing)|"
@@ -240,6 +245,7 @@ async def resolve_model_hub_launch(
     requested_model: str,
     *,
     process_scope: Optional[str] = None,
+    context: Any = None,
 ) -> ModelHubLaunch:
     router = getattr(controller, "model_hub_runtime", None)
     resolver = getattr(router, "resolve", None)
@@ -255,12 +261,14 @@ async def resolve_model_hub_launch(
                 turn_id=turn_id,
             )
         except ModelHubError as exc:
-            raise _localized_launch_error(
+            failure = _localized_launch_error(
                 controller,
                 backend,
                 requested_model,
                 exc,
-            ) from None
+            )
+            _hold_unrunnable_input(context, failure)
+            raise failure from None
     return ModelHubLaunch(
         backend=backend,
         channel="direct",
@@ -274,6 +282,8 @@ async def resolve_opencode_overlay_launch(
     controller: Any,
     requested_model: str,
     overlay: OpenCodeOverlay | None,
+    *,
+    context: Any = None,
 ) -> ModelHubLaunch:
     router = getattr(controller, "model_hub_runtime", None)
     resolver = getattr(router, "resolve_opencode_overlay_launch", None)
@@ -281,13 +291,49 @@ async def resolve_opencode_overlay_launch(
         try:
             return await resolver(overlay, requested_model)
         except ModelHubError as exc:
-            raise _localized_launch_error(
+            failure = _localized_launch_error(
                 controller,
                 "opencode",
                 requested_model,
                 exc,
-            ) from None
-    return await resolve_model_hub_launch(controller, "opencode", requested_model)
+            )
+            _hold_unrunnable_input(context, failure)
+            raise failure from None
+    return await resolve_model_hub_launch(
+        controller, "opencode", requested_model, context=context,
+    )
+
+
+def launch_refusal_copy(controller: Any, error: BaseException) -> str | None:
+    """The copy a turn shows when the Hub refused its launch, or ``None``.
+
+    The refusal names its turn-outcome matrix row, so every backend shows that
+    row's copy as it is, never an exception name, a raw key, or a startup
+    label around it.
+    """
+
+    outcome = turn_refusal(error)
+    if outcome is None:
+        return None
+    return render_turn_outcome_copy(outcome, _language(controller))
+
+
+def _hold_unrunnable_input(context: Any, error: ModelHubError) -> None:
+    """Keep an input whose model the backend does not list for an explicit retry.
+
+    Sending it again unchanged fails the same way, so it must not spend the
+    automatic startup retries a transient failure gets.
+    """
+
+    if context is not None and is_unlisted_model_outcome(error.turn_outcome):
+        mark_prewrite_recovery_required(context, UNLISTED_MODEL_RETRY_REASON)
+
+
+def _language(controller: Any) -> str:
+    return str(
+        getattr(getattr(controller, "config", None), "language", "en")
+        or "en"
+    )
 
 
 def _localized_launch_error(
@@ -298,11 +344,7 @@ def _localized_launch_error(
 ) -> ModelHubError:
     if error.turn_outcome is None:
         return error
-    language = str(
-        getattr(getattr(controller, "config", None), "language", "en")
-        or "en"
-    )
-    detail = render_turn_outcome_copy(error.turn_outcome, language)
+    detail = render_turn_outcome_copy(error.turn_outcome, _language(controller))
     if detail is None:
         return error
     return ModelHubError(
@@ -784,17 +826,20 @@ class ModelHubRuntimeRouter:
         requested_model: str,
         process_scope: Optional[str],
         turn_id: Optional[str],
+        listed_only: bool = False,
     ) -> ModelHubError:
+        view = None
+        if listed_only:
+            # A backend that addresses only listed rows cannot take a manual
+            # Route retained for an id its list does not hold.
+            view = self.service._clone_config(self.service.store.load())
+            view.agents[backend].routes.pop(requested_model, None)
         projection_config, projection_resolution = self.service._inspect_terminal_chain(
             backend=backend,
             model_id=requested_model,
+            config=view,
         )
-        turn_outcome = produce_turn_outcome(
-            (
-                "turn.no_candidate.unconfigured"
-                if projection_resolution.route_unconfigured
-                else "turn.no_candidate.blocked"
-            ),
+        turn_outcome = self.service._produce_no_candidate_terminal_outcome(
             config=projection_config,
             resolution=projection_resolution,
         )
@@ -815,7 +860,9 @@ class ModelHubRuntimeRouter:
                 supply_state=supply_state,
                 blockers=exact_hop_blockers(projection_resolution),
             )
-        if (
+        # An unlisted id is not a model of this backend, so it has no supply to
+        # interrupt: the turn's own refusal is the whole report.
+        if not is_unlisted_model_outcome(turn_outcome) and (
             not projection_resolution.matching_sources
             or projection_resolution.structural_blocker_reason is not None
         ):
@@ -1036,6 +1083,15 @@ class ModelHubRuntimeRouter:
         )
         if launch is None:
             config = self.service.store.load()
+            if all(model.id != requested_model for model in config.agents["opencode"].models):
+                # The overlay holds launches only for listed rows.
+                raise self._no_candidate_error(
+                    backend="opencode",
+                    requested_model=requested_model,
+                    process_scope="opencode:shared-server",
+                    turn_id=None,
+                    listed_only=True,
+                )
             config, resolution = await self._resolve_turn(
                 config,
                 "opencode",
@@ -1245,10 +1301,9 @@ def opencode_requested_model_for_overlay(
         if not overlay.available_identifiers:
             raise ModelHubError("mapping_target_unavailable", status=409)
         return overlay.available_identifiers[0]
-    candidate = opencode_menu_model_id(candidate, overlay.checked_identifiers)
-    if candidate in overlay.checked_identifiers:
-        return candidate
-    raise ModelHubError("mapping_target_unavailable", status=409)
+    # A selection no menu row names is still the turn's request: the launch
+    # resolution refuses it with the copy that says why.
+    return opencode_menu_model_id(candidate, overlay.checked_identifiers)
 
 
 def opencode_model_for_overlay(

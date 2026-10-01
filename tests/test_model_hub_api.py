@@ -3829,6 +3829,199 @@ def test_backend_catalog_guarded_removal_excludes_removed_model_and_accepts_echo
     } == before_other_agents
 
 
+@pytest.mark.parametrize(
+    ("backend", "agent_model", "supplied", "mode"),
+    (
+        ("claude", None, False, "hub"),
+        ("codex", None, False, "hub"),
+        ("opencode", "openai/gpt-5.6-sol", False, "hub"),
+        ("opencode", "openai/gpt-5.6-sol", True, "hub"),
+        ("codex", None, False, "direct"),
+    ),
+)
+def test_mh_unlisted_002_model_list_save_names_the_agents_a_removed_row_stops(
+    monkeypatch,
+    tmp_path,
+    backend,
+    agent_model,
+    supplied,
+    mode,
+):
+    """MH-UNLISTED-002: removing a row an enabled Agent selects names that Agent
+    under the removed menu id, whatever the row's supply was before the save."""
+
+    service, store, _adapter = _service(tmp_path)
+    agent = store.config.agents[backend]
+    agent.mode = mode
+    if backend == "opencode":
+        agent.models = [
+            ModelHubBackendModelConfig(id=model_id, native_protocol="openai_responses")
+            for model_id in ("gpt-5.6-sol", "gpt-kept")
+        ]
+        agent.menu.checked = ["gpt-5.6-sol", "gpt-kept"]
+    model_id = agent.models[0].id
+    if supplied:
+        store.config.sources = [
+            ModelHubSourceConfig(
+                id="src_unlisted02",
+                kind="api_key",
+                vendor="openai",
+                display_name="Unlisted source",
+                protocol="openai_responses",
+                supply_channel="hub",
+                billing="metered",
+                state=ModelHubSourceStateConfig(status="standby"),
+                models=[ModelHubModelConfig(id=model_id, provenance="discovered")],
+                credential_ref="cred_unlisted02",
+            )
+        ]
+        agent.sources.order = ["src_unlisted02"]
+    service.named_agents_override = lambda name: (
+        [("写作助手", agent_model or model_id), ("pm", agent_model or model_id), ("other", "gpt-kept")]
+        if name == backend
+        else []
+    )
+    monkeypatch.setattr(ui_server, "_model_hub_service", lambda: _as_ui_client(service))
+    client = app.test_client()
+    base_url = "http://127.0.0.1:15131"
+    headers = csrf_headers(client, base_url)
+    endpoint = f"/api/models/agents/{backend}/models"
+    baseline = next(item["catalog_models"] for item in service.list_agents() if item["backend"] == backend)
+    request_body = {
+        "baseline": baseline,
+        "models": [row for row in baseline if row["id"] != model_id],
+    }
+
+    response = client.put(endpoint, json=request_body, headers=headers, base_url=base_url)
+
+    if mode == "direct":
+        assert response.status_code == 200
+        assert model_id not in {model.id for model in store.config.agents[backend].models}
+        return
+    assert response.status_code == 409
+    refusal = response.get_json()
+    _assert_valid("guard-refusal.schema.json", refusal)
+    assert refusal["error"] == "backend_model_in_route"
+    assert refusal["would_interrupt"] == [
+        {"backend": backend, "model_id": model_id, "agents": ["pm", "写作助手"]}
+    ]
+    assert [hop["menu_model"] for hop in refusal["would_remove_hops"]] == (
+        [model_id] if supplied else []
+    )
+    assert model_id in {model.id for model in store.config.agents[backend].models}
+
+    committed = client.put(
+        endpoint,
+        json={
+            **request_body,
+            "force": True,
+            "would_remove_hops": refusal["would_remove_hops"],
+            "would_interrupt": refusal["would_interrupt"],
+        },
+        headers=headers,
+        base_url=base_url,
+    )
+
+    assert committed.status_code == 200
+    result = committed.get_json()
+    Draft7Validator(
+        {"$ref": "model-hub/api-response.schema.json#/definitions/AgentModelsResponse"},
+        registry=_api_response_registry(),
+        format_checker=FormatChecker(),
+    ).validate(result)
+    # The success reports the Agents it stopped even when no route went with them.
+    assert result["removed_hops"] == refusal["would_remove_hops"]
+    assert result["interrupted"] == refusal["would_interrupt"]
+    assert model_id not in {model.id for model in store.config.agents[backend].models}
+
+
+@pytest.mark.parametrize("fallback", ("kept", "added_in_same_save"))
+@pytest.mark.parametrize(
+    ("fallback_supplied", "expected_gaps"),
+    (
+        (True, []),
+        (False, [{"backend": "opencode", "model_id": "kimi-k2", "agents": ["writer"]}]),
+    ),
+)
+def test_mh_unlisted_002_opencode_fallback_row_keeps_an_agent_running(
+    monkeypatch,
+    tmp_path,
+    fallback,
+    fallback_supplied,
+    expected_gaps,
+):
+    """MH-UNLISTED-002: an OpenCode selection that names a row of the saved
+    catalog, kept or added by the same save, is stopped only when that row
+    cannot run, and is then named under the row it now runs on. The plan is
+    computed from the complete staged catalog, so the exact echo of the same
+    request commits it."""
+
+    service, store, _adapter = _service(tmp_path)
+    agent = store.config.agents["opencode"]
+    kept_ids = ("moonshotai/kimi-k2", "kimi-k2") if fallback == "kept" else ("moonshotai/kimi-k2",)
+    agent.models = [
+        ModelHubBackendModelConfig(id=model_id, native_protocol="openai_responses")
+        for model_id in kept_ids
+    ]
+    agent.menu.checked = list(kept_ids)
+    if fallback_supplied:
+        store.config.sources = [
+            ModelHubSourceConfig(
+                id="src_fallback01",
+                kind="api_key",
+                vendor="openai",
+                display_name="Fallback source",
+                protocol="openai_responses",
+                supply_channel="hub",
+                billing="metered",
+                state=ModelHubSourceStateConfig(status="standby"),
+                models=[ModelHubModelConfig(id="kimi-k2", provenance="discovered")],
+                credential_ref="cred_fallback01",
+            )
+        ]
+        agent.sources.order = ["src_fallback01"]
+    service.named_agents_override = lambda name: (
+        [("writer", "moonshotai/kimi-k2")] if name == "opencode" else []
+    )
+    monkeypatch.setattr(ui_server, "_model_hub_service", lambda: _as_ui_client(service))
+    client = app.test_client()
+    base_url = "http://127.0.0.1:15131"
+    headers = csrf_headers(client, base_url)
+    baseline = next(item["catalog_models"] for item in service.list_agents() if item["backend"] == "opencode")
+    desired = [row for row in baseline if row["id"] != "moonshotai/kimi-k2"]
+    if fallback == "added_in_same_save":
+        desired.append({**baseline[0], "id": "kimi-k2", "origin": "manual"})
+    request_body = {"baseline": baseline, "models": desired}
+    endpoint = "/api/models/agents/opencode/models"
+
+    response = client.put(endpoint, json=request_body, headers=headers, base_url=base_url)
+
+    # A supplied fallback leaves only the removed row's passthrough hop to confirm.
+    assert response.status_code == 409
+    refusal = response.get_json()
+    _assert_valid("guard-refusal.schema.json", refusal)
+    assert refusal["would_interrupt"] == expected_gaps
+    assert [hop["menu_model"] for hop in refusal["would_remove_hops"]] == (
+        ["moonshotai/kimi-k2"] if fallback_supplied else []
+    )
+
+    committed = client.put(
+        endpoint,
+        json={
+            **request_body,
+            "force": True,
+            "would_remove_hops": refusal["would_remove_hops"],
+            "would_interrupt": refusal["would_interrupt"],
+        },
+        headers=headers,
+        base_url=base_url,
+    )
+
+    assert committed.status_code == 200
+    assert committed.get_json()["interrupted"] == expected_gaps
+    assert [model.id for model in store.config.agents["opencode"].models] == ["kimi-k2"]
+
+
 def test_backend_catalog_removes_model_with_empty_route(tmp_path):
     service, store, _adapter = _service(tmp_path)
     baseline = next(agent["catalog_models"] for agent in service.list_agents() if agent["backend"] == "codex")

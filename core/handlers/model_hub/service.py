@@ -136,6 +136,7 @@ from .provenance import (
     ExactHopBlocker,
     TurnOutcomeProjectionInput,
     exact_hop_blockers,
+    no_candidate_decision,
     produce_turn_outcome,
 )
 from .request import ModelHubRequest
@@ -374,6 +375,16 @@ class ModelHubError(Exception):
         self.blockers = tuple(blockers)
         self.turn_outcome = turn_outcome
         self.local_error_detail = local_error_detail
+
+
+def turn_refusal(error: BaseException | None) -> TurnOutcomeProjectionInput | None:
+    """The turn outcome a Model Hub error refuses its turn with, if it is one.
+
+    Such an error states its own cause, so text matching on its message can
+    only misread it, for example a model id that happens to say ``oauth``.
+    """
+
+    return error.turn_outcome if isinstance(error, ModelHubError) else None
 
 
 class CredentialCleanupUnsettledError(ModelHubError):
@@ -3892,6 +3903,54 @@ class ModelHubService:
                 add(model_id)
         return protected
 
+    def _removed_agent_models(
+        self,
+        previous: ModelHubConfig,
+        updated: ModelHubConfig,
+        backend: BackendName,
+        removed_model_ids: set[str],
+    ) -> list[dict]:
+        """The Agents a model-list removal stops, as supply gaps.
+
+        An Agent is affected only when the row its selection names before the
+        save is removed. If its selection then names no surviving row, the
+        removal stops it whatever supply the row had, and the gap carries the
+        removed row's id. An OpenCode selection can still name a surviving row
+        (``openai/foo`` falls back to ``foo``); it is stopped only when that row
+        has no runnable hop, and the gap carries the row it now runs on. Both
+        lists are matched the way the turn path matches them.
+        """
+
+        before = previous.agents[backend]
+        after = updated.agents[backend]
+        if before.mode != "hub" or self.named_agents_override is None:
+            return []
+        unavailable_source_ids = self._unavailable_native_sources(updated, backend)
+        live_recovery = self.recovery_annotations(updated)
+        surviving_ids = {model.id for model in after.models}
+        agents_by_model: dict[str, set[str]] = {}
+        for name, selected in self.named_agents_override(backend):
+            selected = str(selected or "").strip()
+            if self._menu_model_for_selection(before, selected) not in removed_model_ids:
+                continue
+            model_id = self._menu_model_for_selection(after, selected)
+            if model_id in surviving_ids and resolve_model_hub_turn(
+                updated,
+                backend,
+                model_id,
+                now=self.now(),
+                unavailable_source_ids=unavailable_source_ids,
+                live_recovery=live_recovery,
+            ).candidates:
+                continue
+            if model_id not in surviving_ids:
+                model_id = self._menu_model_for_selection(before, selected)
+            agents_by_model.setdefault(model_id, set()).add(name)
+        return [
+            {"backend": backend, "model_id": model_id, "agents": sorted(names)}
+            for model_id, names in sorted(agents_by_model.items())
+        ]
+
     def _would_interrupt(
         self,
         config: ModelHubConfig,
@@ -5516,19 +5575,6 @@ class ModelHubService:
                 if model.id not in removed_model_id_set
             ]
 
-            interrupted = self._introduced_interruptions(
-                previous,
-                config,
-            )
-            self._require_guard_plan(
-                force=force,
-                confirmed_remove_hops=confirmed_remove_hops,
-                confirmed_interruptions=confirmed_interruptions,
-                would_remove_hops=removed_hops,
-                would_interrupt=interrupted,
-                error="backend_model_in_route",
-            )
-
             for model_id, desired in desired_by_id.items():
                 baseline_model = baseline_by_id.get(model_id)
                 current = current_by_id.get(model_id)
@@ -5603,6 +5649,24 @@ class ModelHubService:
                     view=agent.menu.view if agent.menu else "featured",
                     checked=list(ordered_ids),
                 )
+            # The guard plans against the complete staged catalog, including the
+            # rows this same save adds, edits and reorders: a removed row's Agent
+            # may run on one of them afterwards. A save that conflicts has
+            # already refused above, so it never asks a confirmation for nothing.
+            interrupted = self._removed_agent_models(
+                previous,
+                config,
+                agent_backend,
+                removed_model_id_set,
+            )
+            self._require_guard_plan(
+                force=force,
+                confirmed_remove_hops=confirmed_remove_hops,
+                confirmed_interruptions=confirmed_interruptions,
+                would_remove_hops=removed_hops,
+                would_interrupt=interrupted,
+                error="backend_model_in_route",
+            )
             await self._commit_synced(previous, config)
             await self._refresh_backend_catalog(cast(BackendName, backend))
             committed = self.store.load()
@@ -5612,7 +5676,7 @@ class ModelHubService:
                     self._agent(committed, backend),
                 )
             }
-            if removed_hops:
+            if removed_hops or interrupted:
                 result["removed_hops"] = removed_hops
                 result["interrupted"] = interrupted
             return result
@@ -7428,10 +7492,15 @@ class ModelHubService:
         *,
         backend: BackendName,
         model_id: str,
+        config: ModelHubConfig | None = None,
     ) -> tuple[ModelHubConfig, ModelHubTurnResolution]:
-        """Inspect the complete effective chain used by the next turn."""
+        """Inspect the complete effective chain used by the next turn.
 
-        config = self.store.load()
+        ``config`` is a view of the stored config, for a backend that can take
+        only part of what is stored; by default the stored config is inspected.
+        """
+
+        config = config if config is not None else self.store.load()
         resolution = resolve_model_hub_turn(
             config,
             backend,
@@ -7514,11 +7583,7 @@ class ModelHubService:
         resolution: ModelHubTurnResolution,
     ) -> TurnOutcomeProjectionInput:
         return produce_turn_outcome(
-            (
-                "turn.no_candidate.unconfigured"
-                if resolution.route_unconfigured
-                else "turn.no_candidate.blocked"
-            ),
+            no_candidate_decision(config, resolution),
             config=config,
             resolution=resolution,
         )

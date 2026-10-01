@@ -183,20 +183,19 @@ describe('BackendModelCatalogDialog', () => {
     expect(write.mock.calls[0][1].models.map((entry: BackendModel) => entry.id)).toEqual(['alpha']);
   });
 
-  it('forces a confirmed focused removal through the guard without asking again, even when the plan moves', async () => {
+  it('forces a confirmed focused removal through a hops-only guard without asking again, even when the plan moves', async () => {
     const user = userEvent.setup();
     const shown = [{ backend: 'claude' as const, menu_model: 'beta', source_id: 'src_a', model_id: 'beta-air', position: 1 }];
     const moved = [{ backend: 'claude' as const, menu_model: 'beta', source_id: 'src_b', model_id: 'beta-max', position: 1 }];
-    const gaps = [{ backend: 'claude' as const, model_id: 'beta', agents: [] }];
-    const refusal = (hops: typeof shown, interrupt: typeof gaps = []) => new ApiCallError(
-      'backend_model_in_route', 'modelHub.errors.backend_model_in_route', true, interrupt, [], hops, 409,
+    const refusal = (hops: typeof shown) => new ApiCallError(
+      'backend_model_in_route', 'modelHub.errors.backend_model_in_route', true, [], [], hops, 409,
     );
     vi.spyOn(modelsApi, 'getAgentSources').mockResolvedValue(agent([model('alpha'), model('beta')], {
       routes: { beta: { hops: [{ source_id: 'src_a', model_id: 'beta-air' }] } },
     }));
     const write = vi.spyOn(modelsApi, 'putAgentModels')
       .mockRejectedValueOnce(refusal(shown))
-      .mockRejectedValueOnce(refusal(moved, gaps))
+      .mockRejectedValueOnce(refusal(moved))
       .mockResolvedValue(agent([model('alpha')]));
     const { onClose } = renderDialog({ focus: { modelId: 'beta', action: 'remove' } });
     const confirm = await screen.findByRole('dialog', { name: 'Remove beta?' });
@@ -206,7 +205,40 @@ describe('BackendModelCatalogDialog', () => {
     expect(write).toHaveBeenCalledTimes(3);
     expect(write.mock.calls[0][1].force).toBeUndefined();
     expect(write.mock.calls[1][1]).toMatchObject({ force: true, would_remove_hops: shown, would_interrupt: [] });
-    expect(write.mock.calls[2][1]).toMatchObject({ force: true, would_remove_hops: moved, would_interrupt: gaps });
+    expect(write.mock.calls[2][1]).toMatchObject({ force: true, would_remove_hops: moved, would_interrupt: [] });
+  });
+
+  it.each([
+    ['on its first refusal', 0],
+    ['after its plan moves', 1],
+  ])('MH-UNLISTED-002: shows the Agents a focused removal would stop %s before anything commits', async (_, hopsFirst) => {
+    const user = userEvent.setup();
+    const hops = [{ backend: 'claude' as const, menu_model: 'beta', source_id: 'src_a', model_id: 'beta-air', position: 1 }];
+    const gaps = [{ backend: 'claude' as const, model_id: 'beta', agents: ['pm'] }];
+    const refusal = (interrupt: typeof gaps) => new ApiCallError(
+      'backend_model_in_route', 'modelHub.errors.backend_model_in_route', true, interrupt, [], hops, 409,
+    );
+    vi.spyOn(modelsApi, 'getAgentSources').mockResolvedValue(agent([model('alpha'), model('beta')], {
+      routes: { beta: { hops: [{ source_id: 'src_a', model_id: 'beta-air' }] } },
+    }));
+    const write = vi.spyOn(modelsApi, 'putAgentModels');
+    if (hopsFirst) write.mockRejectedValueOnce(refusal([]));
+    write.mockRejectedValueOnce(refusal(gaps)).mockResolvedValue(agent([model('alpha')]));
+    const { onClose } = renderDialog({ focus: { modelId: 'beta', action: 'remove' } });
+    const confirm = await screen.findByRole('dialog', { name: 'Remove beta?' });
+    await user.click(within(confirm).getByRole('button', { name: 'Remove' }));
+
+    // The focused confirmation showed hops only, so it never agreed to stop pm.
+    const guard = await screen.findByRole('dialog', { name: 'Save the model list?' });
+    expect(within(guard).getByText('Agents pinned to it: pm')).toBeTruthy();
+    expect(write).toHaveBeenCalledTimes(1 + hopsFirst);
+    expect(write.mock.calls.every(([, body]) => body.would_interrupt === undefined || body.would_interrupt.length === 0)).toBe(true);
+    expect(onClose).not.toHaveBeenCalled();
+
+    await user.click(within(guard).getByRole('button', { name: 'Remove anyway' }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith({ removed: true }));
+    expect(write.mock.calls.at(-1)?.[1]).toMatchObject({ force: true, would_remove_hops: hops, would_interrupt: gaps });
+    expect(write.mock.calls.at(-1)?.[1].models.map((entry: BackendModel) => entry.id)).toEqual(['alpha']);
   });
 
   it('keeps a confirmed focused removal on screen until its forced resend lands', async () => {
@@ -571,6 +603,65 @@ describe('BackendModelCatalogDialog', () => {
     expect(second.force).toBe(true);
     expect(JSON.stringify(second.would_remove_hops)).toBe(JSON.stringify(hops));
     expect(JSON.stringify(second.would_interrupt)).toBe(JSON.stringify([]));
+  });
+
+  it('MH-UNLISTED-002: names the Agents a removed row stops when the row has no route, then echoes that plan', async () => {
+    const user = userEvent.setup();
+    // No route goes with `beta`: the guard refuses only because Agents select it.
+    const gaps = [{ backend: 'claude' as const, model_id: 'beta', agents: ['pm', '写作助手'] }];
+    vi.spyOn(modelsApi, 'getAgentSources').mockResolvedValue(agent([model('alpha'), model('beta')]));
+    const write = vi.spyOn(modelsApi, 'putAgentModels')
+      .mockRejectedValueOnce(new ApiCallError(
+        'backend_model_in_route', 'modelHub.errors.backend_model_in_route', true, gaps, [], [], 409,
+      ))
+      .mockResolvedValue(agent([model('alpha')]));
+    const { onClose } = renderDialog();
+
+    await user.click(await screen.findByRole('button', { name: 'Remove beta' }));
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    const guard = await screen.findByRole('dialog', { name: 'Save the model list?' });
+    expect(guard.textContent).toContain(i18n.t('settings.models.gateway.catalog.guardSubtitleInUse'));
+    expect(guard.textContent).not.toContain(i18n.t('settings.models.gateway.catalog.guardSubtitle'));
+    expect(within(guard).getByText('Agents pinned to it: pm, 写作助手')).toBeTruthy();
+
+    await user.click(within(guard).getByRole('button', { name: 'Remove anyway' }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith(undefined));
+    expect(write).toHaveBeenCalledTimes(2);
+    const confirmed = write.mock.calls[1][1] as Record<string, unknown>;
+    expect(confirmed.force).toBe(true);
+    expect(JSON.stringify(confirmed.would_remove_hops)).toBe(JSON.stringify([]));
+    expect(JSON.stringify(confirmed.would_interrupt)).toBe(JSON.stringify(gaps));
+  });
+
+  it('MH-UNLISTED-002: asks again before a confirmed save stops an Agent the guard did not show', async () => {
+    const user = userEvent.setup();
+    const shown = [{ backend: 'claude' as const, model_id: 'beta', agents: ['pm'] }];
+    const grown = [{ backend: 'claude' as const, model_id: 'beta', agents: ['ops', 'pm'] }];
+    const refusal = (gaps: typeof shown) => new ApiCallError(
+      'backend_model_in_route', 'modelHub.errors.backend_model_in_route', true, gaps, [], [], 409,
+    );
+    vi.spyOn(modelsApi, 'getAgentSources').mockResolvedValue(agent([model('alpha'), model('beta')]));
+    const write = vi.spyOn(modelsApi, 'putAgentModels')
+      .mockRejectedValueOnce(refusal(shown))
+      .mockRejectedValueOnce(refusal(grown))
+      .mockResolvedValue(agent([model('alpha')]));
+    const { onClose } = renderDialog();
+
+    await user.click(await screen.findByRole('button', { name: 'Remove beta' }));
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    const first = await screen.findByRole('dialog', { name: 'Save the model list?' });
+    expect(within(first).getByText('Agents pinned to it: pm')).toBeTruthy();
+    await user.click(within(first).getByRole('button', { name: 'Remove anyway' }));
+
+    // pm was agreed to; ops was never shown, so the grown plan is asked, not forced.
+    await screen.findByText('Agents pinned to it: ops, pm');
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(onClose).not.toHaveBeenCalled();
+
+    await user.click(within(screen.getByRole('dialog', { name: 'Save the model list?' })).getByRole('button', { name: 'Remove anyway' }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith(undefined));
+    expect(write).toHaveBeenCalledTimes(3);
+    expect(write.mock.calls[2][1]).toMatchObject({ force: true, would_remove_hops: [], would_interrupt: grown });
   });
 
   it('keeps the confirmed guard mounted and busy until the forced save lands', async () => {
