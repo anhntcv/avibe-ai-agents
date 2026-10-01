@@ -13,7 +13,14 @@ import { VaultLockIndicator } from '../ui/vault-lock-indicator';
 import { onPageReactivated } from '../../lib/pageActivity';
 import { cn } from '../../lib/utils';
 import { partitionTags } from '../../lib/vaultTags';
-import { useApi, type VaultAuditEvent, type VaultGrant, type VaultRequest, type VaultSecret } from '../../context/ApiContext';
+import {
+  useApi,
+  type VaultAuditEvent,
+  type VaultGrant,
+  type VaultRequest,
+  type VaultRevealContextResult,
+  type VaultSecret,
+} from '../../context/ApiContext';
 import { useToast } from '../../context/ToastContext';
 import type { ApprovalOutcome } from '../ui/vault-approval-card';
 import { SigningAddressList } from '../ui/signing-address-list';
@@ -22,7 +29,7 @@ import { vaultRequestSessionDisplay } from '../ui/vault-request-session';
 import { VaultRequestSessionLink } from '../ui/vault-request-session-link';
 import { VaultSecretDialog } from '../ui/vault-secret-dialog';
 import { VaultSettingsDialog } from '../ui/vault-settings-dialog';
-import { useProtectedVault } from '../../lib/useProtectedVault';
+import { useProtectedVault, useVaultSandboxWarm } from '../../lib/useProtectedVault';
 import {
   openVaultsInBrowser,
   readVaultBrowserStep,
@@ -30,6 +37,7 @@ import {
   withoutVaultBrowserStep,
 } from '../../lib/vaultBrowserHandoff';
 import { vaultApprovalNeedsPasskey } from '../../lib/vaultRequestPlacement';
+import { usePreparedRequest } from '../../lib/usePreparedRequest';
 import { openVaultAuthorizationWindow } from '../../lib/vaultSandboxClient';
 import { useVaultRequestRefresh } from '../../lib/useVaultRequestRefresh';
 import {
@@ -38,6 +46,10 @@ import {
 
 const PENDING_REQUEST_EXPIRY_GRACE_MS = 100;
 const MAX_BROWSER_TIMEOUT_MS = 2_147_483_647;
+// A reveal context stays valid for two minutes; the one an open row menu keeps ready for its click is
+// at most half a minute old.
+const PREPARED_REVEAL = { maxAgeMs: 30_000, refreshMs: 20_000, latestOnly: false };
+const revealContextIssued = (reply: VaultRevealContextResult) => Boolean(reply?.ok && reply.context);
 
 const messageFromError = (err: unknown) => (err instanceof Error ? err.message : String(err));
 /** All allowed proxy-fetch hosts on a secret (for the `proxy · <host> +N` badge). */
@@ -54,7 +66,9 @@ const SecretRow: React.FC<{
   canManage: boolean;
   menuOpen: boolean;
   onMenuOpenChange: (open: boolean) => void;
-}> = ({ secret: s, onEdit, onDelete, onReveal, canManage, menuOpen, onMenuOpenChange: setMenuOpen }) => {
+  /** The open menu's reveal context or sandbox client is not ready yet. */
+  revealPreparing: boolean;
+}> = ({ secret: s, onEdit, onDelete, onReveal, canManage, menuOpen, onMenuOpenChange: setMenuOpen, revealPreparing }) => {
   const { t } = useTranslation();
   const isKeypair = s.kind === 'keypair';
   const isProtected = s.protection === 'protected';
@@ -144,25 +158,27 @@ const SecretRow: React.FC<{
                 <button
                   type="button"
                   role="menuitem"
+                  disabled={revealPreparing}
                   onClick={() => {
                     setMenuOpen(false);
                     onReveal(s);
                   }}
-                  className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm text-foreground transition-colors hover:bg-surface-2"
+                  className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm text-foreground transition-colors hover:bg-surface-2 disabled:cursor-default disabled:opacity-50 disabled:hover:bg-transparent"
                 >
-                  <Eye className="size-4 text-muted" />
+                  {revealPreparing ? <Loader2 className="size-4 animate-spin text-muted" /> : <Eye className="size-4 text-muted" />}
                   {t('vaults.reveal.show')}
                 </button>
                 <button
                   type="button"
                   role="menuitem"
+                  disabled={revealPreparing}
                   onClick={() => {
                     setMenuOpen(false);
                     onReveal(s);
                   }}
-                  className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm text-foreground transition-colors hover:bg-surface-2"
+                  className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm text-foreground transition-colors hover:bg-surface-2 disabled:cursor-default disabled:opacity-50 disabled:hover:bg-transparent"
                 >
-                  <Copy className="size-4 text-muted" />
+                  {revealPreparing ? <Loader2 className="size-4 animate-spin text-muted" /> : <Copy className="size-4 text-muted" />}
                   {t('vaults.reveal.copy')}
                 </button>
                 <div className="my-1 h-px bg-border" />
@@ -723,12 +739,26 @@ export const VaultsPage: React.FC = () => {
   // Reveal a protected static value inside the sandbox frame (protocol v2 §7.4): fetch a signed
   // reveal context + the sealed envelope, then let the sandbox open + display it. Plaintext never
   // returns to Avibe; the sandbox confirms in its top-level authorization window (and passkey when
-  // locked/Strict), which this click opens before any await.
+  // locked/Strict), which this click opens before any await. Nothing that window needs may wait on
+  // the daemon after the click (`usePreparedRequest`), so the open row menu keeps the context and the
+  // sandbox client ready, and the click claims them.
+  const requestRevealContext = useCallback(
+    (name: string) => api.createVaultRevealContext(name, { session_label: t('vaults.title') }),
+    [api, t],
+  );
+  const menuRevealName = useMemo(() => {
+    const secret = secrets.find((s) => s.name === menuSecret);
+    return secret?.protection === 'protected' && secret.kind !== 'keypair' && !vaultPasskeyNeedsBrowser() ? secret.name : null;
+  }, [secrets, menuSecret]);
+  const revealContext = usePreparedRequest(menuRevealName, requestRevealContext, revealContextIssued, PREPARED_REVEAL);
+  const revealSandboxReady = useVaultSandboxWarm(menuRevealName !== null);
+  // Show and Copy wait for both, so their click never waits on either.
+  const revealPreparing = !revealSandboxReady || revealContext.pending;
   const revealSecret = useCallback(
     async (secret: VaultSecret) => {
       const authorizationWindow = openVaultAuthorizationWindow();
       try {
-        const res = await api.createVaultRevealContext(secret.name, { session_label: t('vaults.title') });
+        const res = await revealContext.claim(secret.name);
         if (!res?.ok || !res.context) throw new Error(res?.message || t('vaults.reveal.errors.contextFailed'));
         // The sandbox needs the sealed record to open it. The daemon returns it alongside the signed
         // reveal context; if it's absent, surface a clear message rather than a cryptic sandbox error.
@@ -746,7 +776,7 @@ export const VaultsPage: React.FC = () => {
         authorizationWindow?.close();
       }
     },
-    [api, vault, showToast, t],
+    [revealContext, vault, showToast, t],
   );
   const confirmDelete = async () => {
     const secret = deleteTarget;
@@ -907,6 +937,7 @@ export const VaultsPage: React.FC = () => {
               onReveal={revealSecret}
               canManage={canManage}
               menuOpen={s.name === menuSecret}
+              revealPreparing={s.name === menuRevealName && revealPreparing}
               onMenuOpenChange={(open) => setMenuSecret(open ? s.name : null)}
             />
           ))}

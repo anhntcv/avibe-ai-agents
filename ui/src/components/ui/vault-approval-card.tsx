@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next';
 import {
   useApi,
   type SigningAddresses,
+  type VaultAgentBindingsBatchResult,
   type VaultGrantDuration,
   type VaultRequest,
   type VaultSignedOperationContext,
@@ -12,9 +13,10 @@ import {
 } from '@/context/ApiContext';
 import { useInstanceAuthorization } from '@/context/InstanceAuthorizationContext';
 import { partitionTags } from '@/lib/vaultTags';
-import { useProtectedVault, type ProtectedUnlockMaterial } from '@/lib/useProtectedVault';
+import { useProtectedVault, useVaultSandboxWarm, type ProtectedUnlockMaterial } from '@/lib/useProtectedVault';
 import { openVaultsInBrowser, vaultPasskeyNeedsBrowser } from '@/lib/vaultBrowserHandoff';
 import { vaultApprovalNeedsPasskey } from '@/lib/vaultRequestPlacement';
+import { usePreparedRequest } from '@/lib/usePreparedRequest';
 import { openVaultAuthorizationWindow } from '@/lib/vaultSandboxClient';
 import { SigningAddressList } from './signing-address-list';
 import { type BlindBox, type SignatureResult, type SignatureScheme } from '@/lib/vaultCrypto';
@@ -90,6 +92,15 @@ function addressesForScheme(scheme: string | undefined, addresses: SigningAddres
   // ecdsa-secp256k1-recoverable (Ethereum) and the default.
   return { eth: addresses.eth };
 }
+
+// The approval click opens the sandbox authorization window, which gets its request in time only if
+// nothing it needs waits on the daemon after the click (`usePreparedRequest`): the signed
+// agent-delivery contexts are issued while the card is open, the approve button waits for them and
+// for the sandbox client, and the click claims them. The batch endpoint keeps just its latest issue
+// for a request.
+type BindingsKey = { requestId: string; duration: VaultGrantDuration };
+const PREPARED_BINDINGS = { maxAgeMs: 20_000, refreshMs: 15_000, latestOnly: true };
+const bindingsIssued = (reply: VaultAgentBindingsBatchResult) => reply.ok;
 
 // design.pen `SKBld` / `pRtHq`: a borderless detail list (no inner card) with sentence-case
 // muted row labels at a fixed width and the value flowing to fill.
@@ -226,6 +237,24 @@ export const VaultApprovalCard: React.FC<{
   // Where passkeys can't run, the approver finishes this request in the browser instead; nothing
   // (no binding contexts, no sandbox ceremony) starts here.
   const approveInBrowser = needsProtectedApproval && vaultPasskeyNeedsBrowser();
+  const canApprove = capabilities.can_use_vault_secrets;
+  // Set once this card has approved or denied its request, which is then no longer pending.
+  const [resolved, setResolved] = useState(false);
+  const sendBindings = useCallback(
+    ({ requestId, duration }: BindingsKey) => api.createVaultAgentBindingsBatch({ request_id: requestId, grant_duration: duration }),
+    [api],
+  );
+  const bindings = usePreparedRequest(
+    canApprove && !isSign && !approveInBrowser && materials.length > 0 && option?.grant_id && !busy && !resolved
+      ? { requestId: request.id, duration: grantDurationApiValue(effectiveGrantDuration) }
+      : null,
+    sendBindings,
+    bindingsIssued,
+    PREPARED_BINDINGS,
+  );
+  const sandboxReady = useVaultSandboxWarm(needsProtectedApproval && !approveInBrowser);
+  // Until both are ready the approve button waits, so its click never waits on either.
+  const preparing = !busy && (!sandboxReady || bindings.pending);
 
   useEffect(() => {
     if (needsProtectedApproval) void vault.refresh();
@@ -282,10 +311,11 @@ export const VaultApprovalCard: React.FC<{
         // any await; the sandbox then confirms in that window without a second launcher card.
         const authorizationWindow = openVaultAuthorizationWindow();
         try {
-          // Protected members — ONE batch call returns signed, value-free agent-delivery contexts
-          // for the whole selector; the sandbox then releases every DEK behind ONE confirm (protocol
-          // v2 §7.1) as opaque HPKE blind boxes for the pinned resident agent.
-          const issued = await api.createVaultAgentBindingsBatch({ request_id: request.id, grant_duration: durationValue });
+          // Protected members — ONE batch of signed, value-free agent-delivery contexts covers the
+          // whole selector, issued while the card was open; the sandbox then releases every DEK
+          // behind ONE confirm (protocol v2 §7.1) as opaque HPKE blind boxes for the pinned
+          // resident agent.
+          const issued = await bindings.claim({ requestId: request.id, duration: durationValue });
           failIfNotOk(issued);
           const materialByName = new Map(materials.map((m) => [m.name, m]));
           const approveItems = issued.items.map((item) => {
@@ -313,8 +343,9 @@ export const VaultApprovalCard: React.FC<{
       }
       // Remember the approver's choice as next time's default — but not for one-shot, where the
       // duration was forced to one-time (not chosen), so persisting it would wrongly bias the next
-      // approval. Best-effort: the daemon also persists a real choice on the grant/binding.
+      // approval. Only an approval remembers it: issuing contexts for an open card does not.
       if (!isOneShot) void api.saveVaultSettings({ last_grant_ttl: durationValue }).catch(() => undefined);
+      setResolved(true);
       onResolved({ kind: 'approved', requestType: 'access' });
     });
 
@@ -350,12 +381,14 @@ export const VaultApprovalCard: React.FC<{
         // Standard keypair: avault signs; we only relay the approved request.
         failIfNotOk(await api.signVaultDigest({ name, request_id: request.id, digest, scheme }));
       }
+      setResolved(true);
       onResolved({ kind: 'approved', requestType: 'sign' });
     });
 
   const deny = () =>
     finish(async () => {
       await api.denyVaultRequest(request.id);
+      setResolved(true);
       onResolved({ kind: 'denied', requestType: isSign ? 'sign' : 'access' });
     });
 
@@ -377,8 +410,7 @@ export const VaultApprovalCard: React.FC<{
     );
   }
 
-  const canApprove = capabilities.can_use_vault_secrets;
-  const approveDisabled = busy || !canApprove || (!isSign && !option);
+  const approveDisabled = busy || preparing || !canApprove || (!isSign && !option);
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
@@ -604,7 +636,7 @@ export const VaultApprovalCard: React.FC<{
             </Button>
           ) : (
             <Button type="button" onClick={isSign ? approveSign : approveAccess} disabled={approveDisabled}>
-              {busy ? (
+              {busy || preparing ? (
                 <Loader2 className="size-4 animate-spin" />
               ) : isSign ? (
                 <PenTool className="size-4" />
