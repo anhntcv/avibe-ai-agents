@@ -9,7 +9,11 @@ from typing import Any, Callable, Literal, Optional
 from core.agent_auth_service import classify_auth_error
 from core.agent_tool_policy import runs_in_background as tool_runs_in_background
 from core.backend_failure import backend_failure_notification_output, emit_backend_failure
-from core.handlers.session_handler import ClaudeInputNotSentError, ClaudeSessionNotFoundError
+from core.handlers.session_handler import (
+    ClaudeBackendDisabledError,
+    ClaudeInputNotSentError,
+    ClaudeSessionNotFoundError,
+)
 from core.message_dispatcher import ActivityOutputDeliveryError
 from core.message_output import (
     HARNESS_RUN_ID_TRIGGER_KINDS,
@@ -103,6 +107,18 @@ class _ClaudeOutputRecoveryRecord:
     claim_pending: bool = False
     claim_metadata: dict[str, object] | None = None
 
+
+
+# Read live on every use, so changing them needs no new client.
+_CLAUDE_LIVE_CONFIG_FIELDS = frozenset({"idle_timeout_seconds"})
+
+
+def _claude_launch_inputs(claude_config: Any) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in vars(claude_config).items()
+        if key not in _CLAUDE_LIVE_CONFIG_FIELDS
+    }
 
 class ClaudeAgent(BaseAgent):
     """Existing Claude Code integration extracted into an agent backend."""
@@ -542,6 +558,20 @@ class ClaudeAgent(BaseAgent):
             session_id=composite_key,
         )
 
+    async def _refuse_disabled_turn(self, context, request) -> None:
+        language = str(getattr(getattr(self.controller, "config", None), "language", "en") or "en")
+        await emit_backend_failure(
+            self.controller,
+            context,
+            self.name,
+            "claude backend disabled",
+            display_text=(
+                f"❌ {i18n_t('error.agentRuntimeRetired', language, agent=i18n_t('backend.claude', language))}"
+            ),
+            request=request,
+        )
+        await self._remove_ack_reaction(request)
+
     async def handle_message(self, request: AgentRequest) -> None:
         context = request.context
         runtime_base_session_id = request.base_session_id
@@ -556,17 +586,30 @@ class ClaudeAgent(BaseAgent):
         #     await self._handle_question_callback(request)
         #     return
 
+        if getattr(getattr(self.config, "claude", None), "enabled", True) is False:
+            # Claude stays registered while disabled, so a turn queued behind
+            # the one the disable interrupted still reaches it. It must start
+            # nothing and say why, as Codex and OpenCode do.
+            await self._refuse_disabled_turn(context, request)
+            return
+
         try:
-            client = await self.session_handler.get_or_create_claude_session(
-                context,
-                subagent_name=request.subagent_name,
-                subagent_model=request.subagent_model or getattr(request, "vibe_agent_model", None),
-                subagent_reasoning_effort=(
-                    request.subagent_reasoning_effort
-                    or getattr(request, "vibe_agent_reasoning_effort", None)
-                ),
-                agent_system_prompt=getattr(request, "vibe_agent_system_prompt", None),
-            )
+            try:
+                client = await self.session_handler.get_or_create_claude_session(
+                    context,
+                    subagent_name=request.subagent_name,
+                    subagent_model=request.subagent_model or getattr(request, "vibe_agent_model", None),
+                    subagent_reasoning_effort=(
+                        request.subagent_reasoning_effort
+                        or getattr(request, "vibe_agent_reasoning_effort", None)
+                    ),
+                    agent_system_prompt=getattr(request, "vibe_agent_system_prompt", None),
+                )
+            except ClaudeBackendDisabledError:
+                # Claude was turned off while this turn's client was being
+                # created; the client is already gone.
+                await self._refuse_disabled_turn(context, request)
+                return
             runtime_base_session_id = getattr(client, "_vibe_runtime_base_session_id", runtime_base_session_id)
             runtime_session_key = getattr(client, "_vibe_runtime_session_key", runtime_session_key)
             mark_session_active = getattr(self.session_handler, "mark_session_active", None)
@@ -1051,6 +1094,32 @@ class ClaudeAgent(BaseAgent):
             )
 
         logger.info("Refreshed Claude auth state across %d runtime session(s)", len(session_ids))
+
+    async def adopt_model_hub_catalog(self) -> None:
+        """Nothing to apply: each turn resolves its model, limits, and efforts.
+
+        A session whose resolved launch changed moves to a new client at that
+        turn, by the same rule as any other launch-input change.
+        """
+
+    async def renew_runtime(self, claude_config, *, config_save: bool = False) -> None:
+        """Adopt persisted runtime config; each session moves to it at its next turn.
+
+        Every session owns its own process, so nothing drains or reconnects
+        here: a session's next turn starts a new client, unless background work
+        it started is still running. A config save that changes only fields read
+        live, such as the idle timeout, renews nothing.
+        """
+        previous = self.config.claude
+        self.config.claude = claude_config
+        self.controller.config.claude = claude_config
+        session_handler = getattr(self, "session_handler", None)
+        if session_handler is None:
+            return
+        session_handler.config = self.controller.config
+        if config_save and _claude_launch_inputs(previous) == _claude_launch_inputs(claude_config):
+            return
+        session_handler.renew_runtime()
 
     async def refresh_runtime_config(self, claude_config) -> None:
         """Reload persisted runtime config before reconnecting Claude sessions."""

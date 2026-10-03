@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from modules.agents.base import BaseAgent
@@ -66,6 +68,43 @@ async def test_skill_catalog_is_offered_once_per_accepted_claude_client(monkeypa
     assert accepted.call_args.args[2] is None
     for task in controller.receiver_tasks.values():
         await task
+
+
+@pytest.mark.parametrize("disabled_while_connecting", [False, True], ids=["before-admission", "while-connecting"])
+async def test_runtime_gen_006_a_turn_reaching_a_disabled_claude_starts_nothing(monkeypatch, disabled_while_connecting):
+    """RUNTIME-GEN-006 (Claude): Claude stays registered while disabled, so a turn
+    queued behind the one a disable interrupted still reaches it. It must start
+    no client and tell the user Claude was turned off, also when Claude was
+    turned off while the turn's client was connecting."""
+    from core.handlers.session_handler import ClaudeBackendDisabledError
+
+    controller = _StubController()
+    controller.session_handler.get_or_create_claude_session = AsyncMock(
+        side_effect=ClaudeBackendDisabledError("claude backend disabled")
+    )
+    agent = ClaudeAgent(controller)
+    # Turned off while connecting: still enabled when the turn was admitted.
+    agent.config.claude = SimpleNamespace(enabled=disabled_while_connecting)
+    agent._remove_ack_reaction = AsyncMock()
+    failures = []
+
+    async def emit_backend_failure(_controller, _context, backend, _diagnostic, *, display_text=None, **_kwargs):
+        failures.append((backend, display_text))
+        return False
+
+    monkeypatch.setattr("modules.agents.claude_agent.emit_backend_failure", emit_backend_failure)
+    request = SimpleNamespace(
+        context=SimpleNamespace(platform_specific={}), message="queued", base_session_id="ses",
+        composite_session_id="runtime", session_key="scope", subagent_name=None, subagent_model=None,
+        subagent_reasoning_effort=None, ack_message_id=None, ack_reaction_message_id=None,
+        ack_reaction_emoji=None, files=None, working_path="/fixture",
+    )
+
+    await agent.handle_message(request)
+
+    assert controller.session_handler.get_or_create_claude_session.await_count == (1 if disabled_while_connecting else 0)
+    assert len(failures) == 1 and failures[0][0] == "claude"
+    assert "ClaudeCode was turned off" in failures[0][1]
 
 
 class _StubSessions:
