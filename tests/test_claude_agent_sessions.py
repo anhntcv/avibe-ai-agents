@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -1608,6 +1609,113 @@ class ClaudeAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(composite_key, agent._pending_requests)
         self.assertNotIn(composite_key, agent._native_input_receipts)
 
+    async def test_coalesced_echo_acknowledges_its_whole_queued_run(self):
+        """HFR-487: one native echo may acknowledge every queued input."""
+
+        agent_logger = logging.getLogger("modules.agents.claude_agent")
+        queued = ["first steer", "second steer"]
+        # (name, echo, origin, receipts still pending once the echo is observed)
+        cases = (
+            # Claude dequeues inputs queued behind a response together and
+            # replays them as one newline-joined user message.
+            ("coalesced", "first steer\nsecond steer", None, []),
+            # Avibe input in a shape the receipts do not model: nothing is
+            # guessed, and the drift is logged.
+            ("unrecognized human", "first steer, rewritten", {"kind": "human"}, queued),
+            ("unrecognized origin-less", "first steer, rewritten", None, queued),
+            # Same text as the queued run, but an injected turn is not Avibe input.
+            ("injected notification", "first steer\nsecond steer", {"kind": "task-notification"}, queued),
+        )
+        for name, echo, origin, still_pending in cases:
+            settles = not still_pending
+            observed_pending = []
+            with self.subTest(name):
+                controller = _StubController()
+                controller._get_session_key = lambda _context: "session-1"
+                controller.emit_agent_message = AsyncMock()
+                controller.session_handler.mark_session_idle = lambda _key: None
+                controller.session_handler.handle_session_error = AsyncMock()
+                agent = ClaudeAgent(controller)
+                agent.emit_result_message = AsyncMock()
+                agent._get_formatter = lambda _context: SimpleNamespace(
+                    format_assistant_message=lambda parts: "\n\n".join(parts),
+                )
+                composite_key = "session-coalesced-steer:/tmp/work"
+                context = SimpleNamespace(
+                    user_id="U1",
+                    channel_id="C1",
+                    platform_specific={"turn_token": "T1"},
+                )
+                pending_request = SimpleNamespace(
+                    context=context,
+                    started_at=None,
+                    ack_reaction_message_id=None,
+                    ack_reaction_emoji=None,
+                )
+                agent._pending_requests[composite_key] = [pending_request]
+                for text in ("first steer", "second steer"):
+                    receipt = agent._register_native_input(
+                        composite_key,
+                        text,
+                        kind="steer",
+                    )
+                    receipt.state = "accepted"
+                    agent._advance_steering_generation(composite_key)
+
+                class _Client:
+                    def receive_messages(self):
+                        async def _iterate():
+                            yield type(
+                                "ResultMessage",
+                                (),
+                                {
+                                    "subtype": "success",
+                                    "result": "primary result",
+                                    "duration_ms": 1,
+                                },
+                            )()
+                            yield UserMessage(echo, origin=origin)
+                            observed_pending.append(
+                                [r.text for r in agent._native_input_receipts.get(composite_key, [])]
+                            )
+                            yield type(
+                                "ResultMessage",
+                                (),
+                                {
+                                    "subtype": "success",
+                                    "result": "steered result",
+                                    "duration_ms": 2,
+                                },
+                            )()
+
+                        return _iterate()
+
+                with self.assertLogs("modules.agents.claude_agent", "WARNING") as logs:
+                    await agent._receive_messages(
+                        _Client(),
+                        "session-coalesced-steer",
+                        "/tmp/work",
+                        context,
+                        composite_key=composite_key,
+                    )
+                    agent_logger.warning("receiver finished")
+                drifted = any("matches no pending receipt" in line for line in logs.output)
+                self.assertEqual(drifted, name.startswith("unrecognized"))
+
+                self.assertEqual(observed_pending, [still_pending])
+                if settles:
+                    agent.emit_result_message.assert_awaited_once_with(
+                        context,
+                        "steered result",
+                        subtype="success",
+                        duration_ms=2,
+                        parse_mode="markdown",
+                        request=pending_request,
+                    )
+                    self.assertNotIn(composite_key, agent._native_input_receipts)
+                else:
+                    # Unacknowledged input keeps the Turn open.
+                    agent.emit_result_message.assert_not_awaited()
     async def test_narration_keeps_claude_markdown_as_written(self):
         """Narration reaches every surface as the Markdown Claude wrote, like the Result."""
 

@@ -1530,29 +1530,70 @@ class ClaudeAgent(BaseAgent):
                 return "\n".join(texts)
         return None
 
+    @staticmethod
+    def _echoed_receipt_run(
+        receipts: list[_ClaudeInputReceipt],
+        text: str,
+    ) -> tuple[int, int] | None:
+        """Return the earliest contiguous receipt run one native echo replays.
+
+        Claude dequeues every input queued behind a running response together
+        and replays them as one top-level user message joined by newlines.
+        """
+        for start in range(len(receipts)):
+            joined = receipts[start].text
+            end = start + 1
+            while True:
+                if joined == text:
+                    return start, end
+                if end == len(receipts) or not text.startswith(f"{joined}\n"):
+                    break
+                joined = f"{joined}\n{receipts[end].text}"
+                end += 1
+        return None
+
     def _observe_native_user_input(
         self,
         composite_key: str,
         message,
-    ) -> _ClaudeInputReceipt | None:
+    ) -> list[_ClaudeInputReceipt]:
         text = self._native_user_input_text(message)
         if text is None:
-            return None
+            return []
         receipt_map = self._native_input_receipt_map()
         receipts = receipt_map.get(composite_key) or []
-        for index, receipt in enumerate(receipts):
-            if receipt.text != text:
-                continue
-            receipts.pop(index)
-            if not receipts:
-                receipt_map.pop(composite_key, None)
+        if not receipts:
+            return []
+        origin = self._result_origin_kind(message)
+        if origin not in {None, "human"}:
+            # Injected turns (task notifications, peers, ...) are never Avibe
+            # input, even when their text happens to equal a receipt.
+            return []
+        run = self._echoed_receipt_run(receipts, text)
+        if run is None:
+            # A human or origin-less replay is Avibe input in a shape the receipts
+            # do not model. The stream gives no sound boundary for which receipts
+            # it covers, so they stay pending; make the drift loud instead of
+            # guessing.
+            logger.warning(
+                "Claude replayed input that matches no pending receipt for %s; "
+                "%d input receipt(s) remain pending",
+                composite_key,
+                len(receipts),
+            )
+            return []
+        start, end = run
+        consumed = receipts[start:end]
+        del receipts[start:end]
+        if not receipts:
+            receipt_map.pop(composite_key, None)
+        for receipt in consumed:
             logger.debug(
                 "Observed Claude %s input receipt for %s",
                 receipt.kind,
                 composite_key,
             )
-            return receipt
-        return None
+        return consumed
 
     def _pending_steering_input_state(self, composite_key: str) -> str | None:
         for receipt in self._native_input_receipt_map().get(composite_key) or []:
@@ -2125,11 +2166,11 @@ class ClaudeAgent(BaseAgent):
                             # started, so its owner is unproven.
                             turn_origin = self._result_origin_kind(message) or ""
                         async with self._steering_lock(composite_key):
-                            receipt = self._observe_native_user_input(
+                            receipts = self._observe_native_user_input(
                                 composite_key,
                                 message,
                             )
-                            if receipt is not None and receipt.kind == "steer":
+                            if any(receipt.kind == "steer" for receipt in receipts):
                                 await self._retire_primary_phase_on_steer_receipt(
                                     context,
                                     composite_key,
